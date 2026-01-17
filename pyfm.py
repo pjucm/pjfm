@@ -1030,6 +1030,41 @@ def build_display(radio, width=80):
         stereo_text.append(" (no pilot)", style="dim")
     table.add_row("Audio:", stereo_text)
 
+    # RDS data display (always shown to prevent UI pumping)
+    rds_snapshot = dict(radio.rds_data) if radio.rds_data else {}
+    ps_name = rds_snapshot.get('station_name', '') if radio.rds_enabled else ''
+    pty = rds_snapshot.get('program_type', '') if radio.rds_enabled else ''
+    pi_hex = rds_snapshot.get('pi_hex') if radio.rds_enabled else None
+    radio_text_val = rds_snapshot.get('radio_text', '') if radio.rds_enabled else ''
+    clock_time = rds_snapshot.get('clock_time', '') if radio.rds_enabled else ''
+
+    # Station line: Callsign [Genre]
+    callsign = pi_to_callsign(pi_hex) if pi_hex else None
+    station_info = Text()
+    if callsign:
+        station_info.append(callsign, style="cyan bold")
+    elif pi_hex:
+        station_info.append(f"PI:{pi_hex}", style="cyan")
+    if pty and pty != "None":
+        if callsign or pi_hex:
+            station_info.append("  ", style="")
+        station_info.append(f"[{pty}]", style="yellow")
+    table.add_row("Station:", station_info)
+
+    # Name line: PS (station branding)
+    ps_text = Text(ps_name, style="green bold") if ps_name else Text()
+    table.add_row("Name:", ps_text)
+
+    # Radio text line
+    rt_text = Text(radio_text_val[:50], style="green") if radio_text_val else Text()
+    table.add_row("Text:", rt_text)
+
+    # Clock time line
+    ct_text = Text(clock_time, style="magenta") if clock_time else Text()
+    table.add_row("Time:", ct_text)
+
+    table.add_row("", "")  # Spacer
+
     # Spectrum analyzer status
     spectrum_text = Text()
     if radio.spectrum_enabled:
@@ -1059,11 +1094,10 @@ def build_display(radio, width=80):
         tone_text.append("Treble +3dB", style="green bold")
     else:
         tone_text.append("Treble OFF", style="dim")
-    table.add_row("Tone:", tone_text)
+    table.add_row("Boost:", tone_text)
 
-    # RDS status (get a snapshot with lock)
+    # RDS status (rds_snapshot already obtained above)
     rds_text = Text()
-    rds_snapshot = dict(radio.rds_data) if radio.rds_data else {}
     if radio.rds_enabled:
         rds_text.append("ON", style="green bold")
         if rds_snapshot.get('synced'):
@@ -1087,41 +1121,6 @@ def build_display(radio, width=80):
     else:
         rds_text.append("OFF", style="dim")
     table.add_row("RDS:", rds_text)
-
-    # RDS data display
-    if radio.rds_enabled and rds_snapshot:
-        ps_name = rds_snapshot.get('station_name')  # PS: station branding
-        pty = rds_snapshot.get('program_type')       # PTY: genre
-        pi_hex = rds_snapshot.get('pi_hex')          # PI: call sign encoding
-        radio_text = rds_snapshot.get('radio_text')
-
-        # Station line: Callsign [Genre]
-        callsign = pi_to_callsign(pi_hex) if pi_hex else None
-        if callsign or pty:
-            station_info = Text()
-            if callsign:
-                station_info.append(callsign, style="cyan bold")
-            elif pi_hex:
-                station_info.append(f"PI:{pi_hex}", style="cyan")
-            if pty and pty != "None":
-                if callsign or pi_hex:
-                    station_info.append("  ", style="")
-                station_info.append(f"[{pty}]", style="yellow")
-            table.add_row("Station:", station_info)
-
-        # Name line: PS (station branding) if available
-        if ps_name:
-            ps_text = Text(ps_name, style="green bold")
-            table.add_row("Name:", ps_text)
-
-        if radio_text:
-            rt_text = Text(radio_text[:50], style="green")  # Truncate long text
-            table.add_row("Text:", rt_text)
-
-        clock_time = rds_snapshot.get('clock_time')
-        if clock_time:
-            ct_text = Text(clock_time, style="magenta")
-            table.add_row("Time:", ct_text)
 
     # Performance stats (disabled - only show sample loss if it occurs)
     sample_loss = getattr(radio.device, 'total_sample_loss', 0)
