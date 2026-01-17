@@ -41,6 +41,7 @@ try:
     from rich.table import Table
     from rich.text import Text
     from rich.style import Style
+    from rich.align import Align
     from rich import box
 except ImportError:
     print("Error: rich not installed. Run: pip install rich")
@@ -948,8 +949,8 @@ def build_display(radio, width=80):
     signal_dbm = radio.get_signal_strength()
     s_reading = format_s_meter(signal_dbm)
 
-    # Create main table for aligned fields
-    table = Table(show_header=False, box=None, padding=(0, 1), expand=True)
+    # Create main table for aligned fields (not expanded, will be centered)
+    table = Table(show_header=False, box=None, padding=(0, 1), expand=False)
     table.add_column("Label", style="cyan", width=12, justify="right")
     table.add_column("Value", style="green bold")
 
@@ -1055,8 +1056,9 @@ def build_display(radio, width=80):
     ps_text = Text(ps_name, style="green bold") if ps_name else Text()
     table.add_row("Name:", ps_text)
 
-    # Radio text line
-    rt_text = Text(radio_text_val[:50], style="green") if radio_text_val else Text()
+    # Radio text line (64 chars per RDS spec, left-justified to prevent layout shift)
+    rt_display = radio_text_val[:64].ljust(64) if radio_text_val else " " * 64
+    rt_text = Text(rt_display, style="green")
     table.add_row("Text:", rt_text)
 
     # Clock time line
@@ -1209,7 +1211,7 @@ def build_display(radio, width=80):
     # Controls section
     controls = Text()
     controls.append("\n")
-    controls.append("  ←/→ ", style="cyan bold")
+    controls.append("←/→ ", style="cyan bold")
     controls.append("Tune  ", style="dim")
     controls.append("↑/↓ ", style="cyan bold")
     controls.append("Vol  ", style="dim")
@@ -1228,7 +1230,7 @@ def build_display(radio, width=80):
 
     # Presets section
     presets = Text()
-    presets.append("\n  Presets: ", style="yellow bold")
+    presets.append("\nPresets: ", style="yellow bold")
     for i, preset_freq in enumerate(radio.presets, 1):
         presets.append(f"{i}", style="cyan bold")
         presets.append(":", style="dim")
@@ -1244,24 +1246,24 @@ def build_display(radio, width=80):
         presets.append("  ", style="")
     presets.append("  (Shift+# to set)", style="dim")
 
-    # Build final layout
+    # Build final layout (centered)
     content = Table.grid(expand=True)
-    content.add_row(table)
+    content.add_row(Align.center(table))
 
     # Spectrum analyzer display
     if radio.spectrum_enabled:
         # Calculate available width for spectrum (account for panel padding and borders)
         spectrum_width = max(40, width - 10)
         spectrum_rows = radio.spectrum_analyzer.render(spectrum_width, height=6)
-        spectrum_table = Table(show_header=False, box=None, padding=0, expand=True)
+        spectrum_table = Table(show_header=False, box=None, padding=0, expand=False)
         spectrum_table.add_column("Spectrum")
         for row in spectrum_rows:
             spectrum_table.add_row(row)
         content.add_row(Text(""))  # Spacer
-        content.add_row(spectrum_table)
+        content.add_row(Align.center(spectrum_table))
 
-    content.add_row(controls)
-    content.add_row(presets)
+    content.add_row(Align.center(controls))
+    content.add_row(Align.center(presets))
 
     panel = Panel(
         content,
