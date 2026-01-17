@@ -1228,6 +1228,18 @@ def build_display(radio, width=80):
 
         table.add_row("Peak:", peak_text)
 
+        # Sample loss from BB60D
+        total_loss = getattr(radio.device, 'total_sample_loss', 0)
+        recent_loss = getattr(radio.device, 'recent_sample_loss', 0)
+        loss_text = Text()
+        if total_loss > 0:
+            loss_text.append(f"{total_loss}", style="red bold")
+            if recent_loss > 0:
+                loss_text.append(f"  (recent: {recent_loss})", style="red")
+        else:
+            loss_text.append("0", style="green bold")
+        table.add_row("IQ Loss:", loss_text)
+
     # Controls section
     controls = Text()
     controls.append("\n")
