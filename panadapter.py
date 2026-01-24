@@ -13,6 +13,7 @@ Usage:
 import sys
 import argparse
 import time
+import threading
 import numpy as np
 from collections import deque
 from scipy import signal
@@ -20,7 +21,7 @@ from scipy import signal
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QSplitter, QFrame, QSlider,
-    QCheckBox, QSizePolicy
+    QCheckBox, QSizePolicy, QRadioButton, QButtonGroup
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont, QDoubleValidator
@@ -30,6 +31,7 @@ from pyqtgraph import ColorMap
 import sounddevice as sd
 
 from bb60d import BB60D, BB_MIN_FREQ, BB_MAX_FREQ
+from demodulator import FMStereoDecoder
 
 
 # Default settings
@@ -40,10 +42,19 @@ FFT_SIZE = 4096
 WATERFALL_HISTORY = 300  # Number of rows in waterfall
 UPDATE_RATE_MS = 50  # ~20 fps
 
-# NBFM settings
+# NBFM settings (Weather Radio)
 NBFM_CHANNEL_BW = 12500  # 12.5 kHz channel bandwidth
 NBFM_DEVIATION = 5000    # ±5 kHz deviation
 AUDIO_SAMPLE_RATE = 48000  # Output audio sample rate
+
+# WBFM settings (FM Broadcast)
+WBFM_DEVIATION = 75000   # ±75 kHz deviation
+WBFM_DEEMPHASIS = 75e-6  # 75µs de-emphasis (US standard)
+FM_BROADCAST_MIN = 88.0e6   # FM broadcast band start
+FM_BROADCAST_MAX = 108.0e6  # FM broadcast band end
+FM_BROADCAST_STEP = 100e3   # 100 kHz step for FM broadcast
+FM_BROADCAST_DEFAULT = 89.9e6  # Default FM broadcast frequency
+FM_BROADCAST_SAMPLE_RATE = 1250000  # 1.25 MHz for wider spectrum view (decimated for audio)
 
 
 class NBFMDemodulator:
@@ -198,30 +209,338 @@ class NBFMDemodulator:
         self.audio_buffer.clear()
 
 
-class AudioOutput:
-    """Audio output handler using sounddevice."""
+class WBFMDemodulator:
+    """Wideband FM demodulator for FM broadcast (88-108 MHz) with mono output."""
 
-    def __init__(self, sample_rate=AUDIO_SAMPLE_RATE):
+    def __init__(self, input_sample_rate, audio_sample_rate=AUDIO_SAMPLE_RATE):
+        self.input_sample_rate = input_sample_rate
+        self.audio_sample_rate = audio_sample_rate
+        self.tuned_offset = 0  # Offset from center freq in Hz
+        self.squelch_level = -100  # dB threshold
+        self.squelch_open = False
+
+        # For WBFM we need high IF rate to handle ±75 kHz deviation
+        # Minimum IF rate = 2 * 75 kHz = 150 kHz, use 250 kHz for margin
+        self.if_sample_rate = 250000
+        self.decimation = max(1, int(input_sample_rate / self.if_sample_rate))
+        self.actual_if_rate = input_sample_rate / self.decimation
+
+        # Design channel filter (lowpass at input rate before decimation)
+        # WBFM needs ~200 kHz channel bandwidth to capture full signal
+        channel_cutoff = 120000 / (input_sample_rate / 2)
+        channel_cutoff = min(channel_cutoff, 0.95)  # Stay below Nyquist
+        self.channel_filter_b, self.channel_filter_a = signal.butter(
+            5, channel_cutoff, btype='low'
+        )
+        self.channel_filter_state = None
+
+        # Design audio lowpass filter (15 kHz for mono FM broadcast)
+        audio_cutoff = 15000 / (self.actual_if_rate / 2)
+        audio_cutoff = min(audio_cutoff, 0.95)  # Stay below Nyquist
+        self.audio_filter_b, self.audio_filter_a = signal.butter(
+            4, audio_cutoff, btype='low'
+        )
+        self.audio_filter_state = None
+
+        # De-emphasis filter: 75µs for US FM broadcast
+        # Use matched-pole first-order IIR for accurate time constant
+        # Applied at IF rate before final resampling
+        fs = self.actual_if_rate
+        a = np.exp(-1.0 / (WBFM_DEEMPHASIS * fs))
+        self.deem_b = np.array([1.0 - a])
+        self.deem_a = np.array([1.0, -a])
+        self.deem_state = signal.lfilter_zi(self.deem_b, self.deem_a)
+
+        # Resampler for audio output
+        self.resample_ratio = audio_sample_rate / self.actual_if_rate
+
+        # State for FM demodulation
+        self.prev_sample = 1 + 0j
+
+        # Audio output buffer
+        self.audio_buffer = deque(maxlen=int(audio_sample_rate * 0.5))  # 500ms buffer
+
+    def set_tuned_offset(self, offset_hz):
+        """Set the tuning offset from center frequency."""
+        self.tuned_offset = offset_hz
+
+    def set_squelch(self, level_db):
+        """Set squelch threshold in dB."""
+        self.squelch_level = level_db
+
+    def process(self, iq_data):
+        """
+        Process IQ samples and return demodulated audio.
+
+        Args:
+            iq_data: Complex IQ samples at input_sample_rate
+
+        Returns:
+            Audio samples at audio_sample_rate, or None if squelched
+        """
+        if len(iq_data) == 0:
+            return None
+
+        # Frequency shift to center the desired channel
+        if self.tuned_offset != 0:
+            t = np.arange(len(iq_data)) / self.input_sample_rate
+            shift = np.exp(-2j * np.pi * self.tuned_offset * t)
+            iq_data = iq_data * shift
+
+        # Apply channel filter
+        if self.channel_filter_state is None:
+            self.channel_filter_state = signal.lfilter_zi(
+                self.channel_filter_b, self.channel_filter_a
+            ) * iq_data[0]
+
+        filtered, self.channel_filter_state = signal.lfilter(
+            self.channel_filter_b, self.channel_filter_a,
+            iq_data, zi=self.channel_filter_state
+        )
+
+        # Decimate to IF rate
+        decimated = filtered[::self.decimation]
+
+        # Check signal level for squelch
+        signal_power = np.mean(np.abs(decimated) ** 2)
+        signal_db = 10 * np.log10(signal_power + 1e-20)
+
+        if signal_db < self.squelch_level:
+            self.squelch_open = False
+            return None
+
+        self.squelch_open = True
+
+        # FM demodulation using quadrature method
+        delayed = np.concatenate([[self.prev_sample], decimated[:-1]])
+        self.prev_sample = decimated[-1]
+
+        # Phase difference
+        phase_diff = np.angle(decimated * np.conj(delayed))
+
+        # Scale to audio (deviation determines gain)
+        # For ±75kHz deviation: max_phase = 2*pi*75000/actual_if_rate
+        audio = phase_diff * (self.actual_if_rate / (2 * np.pi * WBFM_DEVIATION))
+
+        # Apply audio lowpass filter (15 kHz)
+        if self.audio_filter_state is None:
+            self.audio_filter_state = signal.lfilter_zi(
+                self.audio_filter_b, self.audio_filter_a
+            ) * audio[0]
+
+        audio_filtered, self.audio_filter_state = signal.lfilter(
+            self.audio_filter_b, self.audio_filter_a,
+            audio, zi=self.audio_filter_state
+        )
+
+        # Apply 75µs de-emphasis
+        audio_deemph, self.deem_state = signal.lfilter(
+            self.deem_b, self.deem_a,
+            audio_filtered, zi=self.deem_state
+        )
+
+        # Resample to output audio rate
+        num_output_samples = int(len(audio_deemph) * self.resample_ratio)
+        if num_output_samples > 0:
+            audio_resampled = signal.resample(audio_deemph, num_output_samples)
+            # Normalize audio level
+            audio_resampled = np.clip(audio_resampled * 0.5, -1.0, 1.0)
+            return audio_resampled.astype(np.float32)
+
+        return None
+
+    def reset(self):
+        """Reset demodulator state (call when changing frequency)."""
+        self.channel_filter_state = None
+        self.audio_filter_state = None
+        self.prev_sample = 1 + 0j
+        self.deem_state = signal.lfilter_zi(self.deem_b, self.deem_a)
+        self.audio_buffer.clear()
+
+
+class WBFMStereoDemodulator:
+    """Wideband FM stereo demodulator wrapper.
+
+    Wraps FMStereoDecoder with the same interface as WBFMDemodulator,
+    providing stereo decoding with pilot detection and SNR-based blending.
+
+    Supports higher input sample rates by using efficient FIR decimation to
+    ~312.5 kHz for optimal stereo decoder performance.
+    """
+
+    # Target sample rate for stereo decoder (matches pyfm)
+    TARGET_RATE = 312500
+
+    def __init__(self, input_sample_rate, audio_sample_rate=AUDIO_SAMPLE_RATE):
+        self.input_sample_rate = input_sample_rate
+        self.audio_sample_rate = audio_sample_rate
+        self.tuned_offset = 0
+        self.squelch_level = -100
+        self.squelch_open = False
+
+        # Calculate decimation factor to get close to TARGET_RATE
+        # Use integer decimation for efficiency
+        self.decimation = max(1, round(input_sample_rate / self.TARGET_RATE))
+        self.decimated_rate = input_sample_rate / self.decimation
+
+        # Design anti-aliasing FIR filter for decimation
+        # Cutoff at 80% of decimated Nyquist to leave transition band
+        if self.decimation > 1:
+            cutoff = 0.8 / self.decimation
+            # Use fewer taps for efficiency (31 taps is enough for 4x decimation)
+            self.decim_filter = signal.firwin(31, cutoff, window='hamming')
+            self.decim_state = None
+        else:
+            self.decim_filter = None
+
+        # Create the stereo decoder at the decimated rate
+        self.stereo_decoder = FMStereoDecoder(
+            iq_sample_rate=self.decimated_rate,
+            audio_sample_rate=audio_sample_rate,
+            deviation=WBFM_DEVIATION,
+            deemphasis=WBFM_DEEMPHASIS
+        )
+
+        # State for frequency shifting
+        self.shift_phase = 0.0
+
+    def set_tuned_offset(self, offset_hz):
+        """Set the tuning offset from center frequency."""
+        self.tuned_offset = offset_hz
+
+    def set_squelch(self, level_db):
+        """Set squelch threshold in dB."""
+        self.squelch_level = level_db
+
+    @property
+    def pilot_detected(self):
+        """Returns True if stereo pilot tone is detected."""
+        return self.stereo_decoder.pilot_detected
+
+    @property
+    def stereo_blend_factor(self):
+        """Returns stereo blend factor (0=mono, 1=full stereo)."""
+        return self.stereo_decoder.stereo_blend_factor
+
+    @property
+    def snr_db(self):
+        """Returns SNR estimate in dB."""
+        return self.stereo_decoder.snr_db
+
+    def process(self, iq_data):
+        """
+        Process IQ samples and return demodulated stereo audio.
+
+        Args:
+            iq_data: Complex IQ samples at input_sample_rate
+
+        Returns:
+            Stereo audio samples (N, 2) at audio_sample_rate, or None if squelched
+        """
+        if len(iq_data) == 0:
+            return None
+
+        # Frequency shift to center the desired channel (track phase continuously)
+        if self.tuned_offset != 0:
+            n = len(iq_data)
+            phase_increment = -2 * np.pi * self.tuned_offset / self.input_sample_rate
+            phases = self.shift_phase + np.arange(n) * phase_increment
+            shift = np.exp(1j * phases)
+            iq_data = iq_data * shift
+            # Update phase for next block, wrap to prevent overflow
+            self.shift_phase = (self.shift_phase + n * phase_increment) % (2 * np.pi)
+
+        # Decimate to target rate using FIR filter + integer decimation
+        if self.decimation > 1:
+            # Initialize filter state on first call
+            if self.decim_state is None:
+                self.decim_state = signal.lfilter_zi(self.decim_filter, 1.0) * iq_data[0]
+
+            # Apply anti-aliasing filter
+            filtered, self.decim_state = signal.lfilter(
+                self.decim_filter, 1.0, iq_data, zi=self.decim_state
+            )
+            # Integer decimation
+            iq_decimated = filtered[::self.decimation]
+        else:
+            iq_decimated = iq_data
+
+        # Check signal level for squelch
+        signal_power = np.mean(np.abs(iq_decimated) ** 2)
+        signal_db = 10 * np.log10(signal_power + 1e-20)
+
+        if signal_db < self.squelch_level:
+            self.squelch_open = False
+            return None
+
+        self.squelch_open = True
+
+        # Demodulate using stereo decoder
+        audio = self.stereo_decoder.demodulate(iq_decimated)
+        return audio
+
+    def reset(self):
+        """Reset demodulator state (call when changing frequency)."""
+        self.shift_phase = 0.0
+        self.decim_state = None
+        self.stereo_decoder.reset()
+
+
+class AudioOutput:
+    """Audio output handler using sounddevice with numpy ring buffer.
+
+    Uses efficient bulk numpy operations instead of per-sample Python loops.
+    """
+
+    def __init__(self, sample_rate=AUDIO_SAMPLE_RATE, channels=1, latency=0.3):
         self.sample_rate = sample_rate
-        self.buffer = deque(maxlen=int(sample_rate * 1.0))  # 1 second buffer
+        self.channels = channels
+        self.latency = latency
         self.stream = None
         self.running = False
         self.gain = 1.0  # Volume gain (0.0 to 2.0)
+
+        # Numpy ring buffer (always stereo internally for simplicity)
+        buffer_samples = int(sample_rate * latency * 4)  # 4x latency for safety
+        self.buffer = np.zeros((buffer_samples, 2), dtype=np.float32)
+        self.write_pos = 0
+        self.read_pos = 0
+        self.buffer_lock = threading.Lock()
 
     def set_gain(self, gain):
         """Set the audio gain (0.0 = mute, 1.0 = normal, 2.0 = +6dB)."""
         self.gain = max(0.0, min(2.0, gain))
 
+    def set_channels(self, channels):
+        """Change the number of output channels (requires restart)."""
+        if channels != self.channels:
+            was_running = self.running
+            if was_running:
+                self.stop()
+            self.channels = channels
+            self._reset_buffer()
+            if was_running:
+                self.start()
+
+    def _reset_buffer(self):
+        """Reset buffer to prefilled state."""
+        with self.buffer_lock:
+            prefill = int(self.sample_rate * self.latency)
+            self.buffer[:] = 0
+            self.write_pos = prefill
+            self.read_pos = 0
+
     def start(self):
         """Start audio output stream."""
         self.running = True
+        self._reset_buffer()
         self.stream = sd.OutputStream(
             samplerate=self.sample_rate,
-            channels=1,
+            channels=self.channels,
             dtype=np.float32,
             callback=self._audio_callback,
             blocksize=1024,
-            latency='low'
+            latency=self.latency
         )
         self.stream.start()
 
@@ -234,24 +553,81 @@ class AudioOutput:
             self.stream = None
 
     def write(self, audio_samples):
-        """Add audio samples to the buffer."""
-        if audio_samples is not None and len(audio_samples) > 0:
-            self.buffer.extend(audio_samples)
+        """Add audio samples to the buffer.
+
+        Args:
+            audio_samples: For mono, shape (N,). For stereo, shape (N, 2).
+        """
+        if audio_samples is None or len(audio_samples) == 0:
+            return
+
+        # Convert to stereo if needed
+        if audio_samples.ndim == 1:
+            audio_samples = np.column_stack((audio_samples, audio_samples))
+
+        with self.buffer_lock:
+            samples = len(audio_samples)
+            buffer_len = len(self.buffer)
+            space = buffer_len - ((self.write_pos - self.read_pos) % buffer_len) - 1
+
+            if samples > space:
+                samples = space  # Drop samples if buffer full
+
+            if samples > 0:
+                end_pos = self.write_pos + samples
+                if end_pos <= buffer_len:
+                    self.buffer[self.write_pos:end_pos] = audio_samples[:samples]
+                else:
+                    # Wrap around
+                    first_part = buffer_len - self.write_pos
+                    self.buffer[self.write_pos:] = audio_samples[:first_part]
+                    self.buffer[:samples - first_part] = audio_samples[first_part:samples]
+                self.write_pos = end_pos % buffer_len
 
     def _audio_callback(self, outdata, frames, time_info, status):
         """Sounddevice callback to fill audio output buffer."""
         gain = self.gain
-        if len(self.buffer) >= frames:
-            for i in range(frames):
-                sample = self.buffer.popleft() * gain
-                outdata[i, 0] = max(-1.0, min(1.0, sample))  # Clip to prevent distortion
-        else:
-            # Not enough data, output silence and use what we have
-            available = len(self.buffer)
-            for i in range(available):
-                sample = self.buffer.popleft() * gain
-                outdata[i, 0] = max(-1.0, min(1.0, sample))
-            outdata[available:, 0] = 0
+        with self.buffer_lock:
+            buffer_len = len(self.buffer)
+            available = (self.write_pos - self.read_pos) % buffer_len
+
+            if available >= frames:
+                end_pos = self.read_pos + frames
+                if end_pos <= buffer_len:
+                    data = self.buffer[self.read_pos:end_pos] * gain
+                else:
+                    # Wrap around
+                    first_part = buffer_len - self.read_pos
+                    data = np.vstack((
+                        self.buffer[self.read_pos:],
+                        self.buffer[:frames - first_part]
+                    )) * gain
+                self.read_pos = end_pos % buffer_len
+
+                # Output mono or stereo as needed
+                if self.channels == 1:
+                    outdata[:, 0] = np.clip((data[:, 0] + data[:, 1]) / 2, -1.0, 1.0)
+                else:
+                    outdata[:] = np.clip(data, -1.0, 1.0)
+            else:
+                # Buffer underrun - output what we have plus silence
+                if available > 0:
+                    end_pos = self.read_pos + available
+                    if end_pos <= buffer_len:
+                        data = self.buffer[self.read_pos:end_pos] * gain
+                    else:
+                        first_part = buffer_len - self.read_pos
+                        data = np.vstack((
+                            self.buffer[self.read_pos:],
+                            self.buffer[:available - first_part]
+                        )) * gain
+                    self.read_pos = end_pos % buffer_len
+
+                    if self.channels == 1:
+                        outdata[:available, 0] = np.clip((data[:, 0] + data[:, 1]) / 2, -1.0, 1.0)
+                    else:
+                        outdata[:available] = np.clip(data, -1.0, 1.0)
+                outdata[available:] = 0
 
 
 class DataThread(QThread):
@@ -640,15 +1016,15 @@ class SMeterWidget(QFrame):
 
         layout.addWidget(self.meter_bar)
 
-        # S-meter text readout
+        # S-meter text readout (fixed width to prevent layout jumping)
         self.reading_label = QLabel('S0')
-        self.reading_label.setMinimumWidth(60)
+        self.reading_label.setFixedWidth(60)
         self.reading_label.setStyleSheet('font-family: monospace; font-weight: bold; font-size: 14px;')
         layout.addWidget(self.reading_label)
 
-        # dBm readout
+        # dBm readout (fixed width to prevent layout jumping)
         self.dbm_label = QLabel('-120 dBm')
-        self.dbm_label.setMinimumWidth(80)
+        self.dbm_label.setFixedWidth(120)
         self.dbm_label.setStyleSheet('font-family: monospace; color: #888;')
         layout.addWidget(self.dbm_label)
 
@@ -693,6 +1069,10 @@ class SMeterWidget(QFrame):
 class MainWindow(QMainWindow):
     """Main application window with spectrum and waterfall displays."""
 
+    # Mode constants
+    MODE_WEATHER = 'weather'  # NBFM Weather Radio
+    MODE_FM_BROADCAST = 'fm_broadcast'  # WBFM FM Broadcast
+
     def __init__(self, center_freq=DEFAULT_CENTER_FREQ):
         super().__init__()
 
@@ -701,13 +1081,18 @@ class MainWindow(QMainWindow):
         self.device = None
         self.data_thread = None
 
+        # Current mode (Weather Radio vs FM Broadcast)
+        self.current_mode = self.MODE_WEATHER
+
         # FFT processing
         self.fft_window = np.hanning(FFT_SIZE)
         self.spectrum_avg = None
         self.avg_factor = 0.7  # Exponential averaging factor
 
-        # NBFM demodulator and audio
-        self.demodulator = None
+        # Demodulators (NBFM for weather, WBFM for broadcast)
+        self.nbfm_demodulator = None
+        self.wbfm_demodulator = None
+        self.demodulator = None  # Currently active demodulator
         self.audio_output = None
         self.tuned_freq = center_freq  # Currently tuned frequency for demod
 
@@ -742,20 +1127,36 @@ class MainWindow(QMainWindow):
         mhz_label = QLabel('MHz')
         control_layout.addWidget(mhz_label)
 
-        # Frequency buttons
-        btn_down = QPushButton('<< -25 kHz')
-        btn_down.clicked.connect(lambda: self.tune(-FREQ_STEP))
-        control_layout.addWidget(btn_down)
+        # Frequency buttons (labels update based on mode)
+        self.btn_down = QPushButton('<< -25 kHz')
+        self.btn_down.clicked.connect(lambda: self.tune(-self.get_freq_step()))
+        control_layout.addWidget(self.btn_down)
 
-        btn_up = QPushButton('+25 kHz >>')
-        btn_up.clicked.connect(lambda: self.tune(FREQ_STEP))
-        control_layout.addWidget(btn_up)
+        self.btn_up = QPushButton('+25 kHz >>')
+        self.btn_up.clicked.connect(lambda: self.tune(self.get_freq_step()))
+        control_layout.addWidget(self.btn_up)
 
         control_layout.addStretch()
 
-        # NOAA preset buttons
-        noaa_label = QLabel('NOAA:')
-        control_layout.addWidget(noaa_label)
+        # Mode selection radio buttons
+        mode_label = QLabel('Mode:')
+        control_layout.addWidget(mode_label)
+
+        self.mode_button_group = QButtonGroup(self)
+        self.weather_radio_btn = QRadioButton('Weather')
+        self.weather_radio_btn.setChecked(True)
+        self.fm_broadcast_btn = QRadioButton('FM Broadcast')
+        self.mode_button_group.addButton(self.weather_radio_btn, 0)
+        self.mode_button_group.addButton(self.fm_broadcast_btn, 1)
+        self.mode_button_group.buttonClicked.connect(self.on_mode_changed)
+        control_layout.addWidget(self.weather_radio_btn)
+        control_layout.addWidget(self.fm_broadcast_btn)
+
+        control_layout.addStretch()
+
+        # NOAA preset buttons (visible only in Weather mode)
+        self.noaa_label = QLabel('NOAA:')
+        control_layout.addWidget(self.noaa_label)
 
         noaa_freqs = [
             ('WX1', 162.550),
@@ -766,11 +1167,13 @@ class MainWindow(QMainWindow):
             ('WX6', 162.500),
             ('WX7', 162.525),
         ]
+        self.noaa_buttons = []
         for name, freq in noaa_freqs:
             btn = QPushButton(name)
             btn.setFixedWidth(50)
             btn.clicked.connect(lambda checked, f=freq: self.set_frequency(f * 1e6))
             control_layout.addWidget(btn)
+            self.noaa_buttons.append(btn)
 
         control_layout.addStretch()
 
@@ -786,7 +1189,7 @@ class MainWindow(QMainWindow):
         demod_layout = QHBoxLayout(demod_frame)
 
         # Enable demod checkbox (on by default)
-        self.demod_checkbox = QCheckBox('NBFM Demod')
+        self.demod_checkbox = QCheckBox('FM Demod')
         self.demod_checkbox.setChecked(True)
         self.demod_checkbox.stateChanged.connect(self.on_demod_toggle)
         demod_layout.addWidget(self.demod_checkbox)
@@ -841,6 +1244,30 @@ class MainWindow(QMainWindow):
 
         demod_layout.addStretch()
 
+        # Stereo indicator (for FM Broadcast mode)
+        self.stereo_label = QLabel('Stereo:')
+        demod_layout.addWidget(self.stereo_label)
+        self.stereo_indicator = QLabel('MONO')
+        self.stereo_indicator.setMinimumWidth(60)
+        self.stereo_indicator.setStyleSheet('font-family: monospace; color: black;')
+        demod_layout.addWidget(self.stereo_indicator)
+
+        # SNR indicator (fixed width to prevent layout jumping)
+        self.snr_label = QLabel('SNR:')
+        demod_layout.addWidget(self.snr_label)
+        self.snr_indicator = QLabel('-- dB')
+        self.snr_indicator.setFixedWidth(90)
+        self.snr_indicator.setStyleSheet('font-family: monospace; color: black;')
+        demod_layout.addWidget(self.snr_indicator)
+
+        # Initially hide stereo/SNR indicators (only show in FM Broadcast mode)
+        self.stereo_label.hide()
+        self.stereo_indicator.hide()
+        self.snr_label.hide()
+        self.snr_indicator.hide()
+
+        demod_layout.addStretch()
+
         # Click-to-tune instruction
         click_label = QLabel('Click spectrum to tune')
         click_label.setStyleSheet('color: gray; font-style: italic;')
@@ -886,13 +1313,31 @@ class MainWindow(QMainWindow):
         from PyQt5.QtWidgets import QShortcut
         from PyQt5.QtGui import QKeySequence
 
-        QShortcut(QKeySequence(Qt.Key_Left), self, lambda: self.tune(-FREQ_STEP))
-        QShortcut(QKeySequence(Qt.Key_Right), self, lambda: self.tune(FREQ_STEP))
-        QShortcut(QKeySequence(Qt.Key_Up), self, lambda: self.tune(FREQ_STEP * 4))
-        QShortcut(QKeySequence(Qt.Key_Down), self, lambda: self.tune(-FREQ_STEP * 4))
+        QShortcut(QKeySequence(Qt.Key_Left), self, lambda: self.tune(-self.get_freq_step()))
+        QShortcut(QKeySequence(Qt.Key_Right), self, lambda: self.tune(self.get_freq_step()))
+        QShortcut(QKeySequence(Qt.Key_Up), self, lambda: self.tune(self.get_freq_step() * 4))
+        QShortcut(QKeySequence(Qt.Key_Down), self, lambda: self.tune(-self.get_freq_step() * 4))
         QShortcut(QKeySequence('P'), self, self.toggle_peak_hold)
         QShortcut(QKeySequence('Q'), self, self.close)
         QShortcut(QKeySequence('Escape'), self, self.close)
+
+    def get_freq_step(self):
+        """Get the frequency step based on current mode."""
+        if self.current_mode == self.MODE_FM_BROADCAST:
+            return FM_BROADCAST_STEP  # 100 kHz for FM broadcast
+        return FREQ_STEP  # 25 kHz for weather radio
+
+    def get_sample_rate(self):
+        """Get the sample rate based on current mode."""
+        if self.current_mode == self.MODE_FM_BROADCAST:
+            return FM_BROADCAST_SAMPLE_RATE  # Wider bandwidth for FM broadcast
+        return SAMPLE_RATE  # Narrower for weather radio
+
+    def update_freq_button_labels(self):
+        """Update frequency button labels based on current step."""
+        step_khz = int(self.get_freq_step() / 1000)
+        self.btn_down.setText(f'<< -{step_khz} kHz')
+        self.btn_up.setText(f'+{step_khz} kHz >>')
 
     def _set_initial_zoom(self):
         """Set initial 100 kHz zoom after UI is ready."""
@@ -917,14 +1362,25 @@ class MainWindow(QMainWindow):
             self.spectrum_widget.set_bandwidth(self.bandwidth)
             self.waterfall_widget.set_bandwidth(self.bandwidth)
 
-            # Initialize NBFM demodulator at center frequency
-            self.demodulator = NBFMDemodulator(self.device.iq_sample_rate)
-            self.demodulator.set_squelch(self.squelch_slider.value())
-            self.demodulator.set_tuned_offset(self.tuned_freq - self.center_freq)
-            self.demodulator.reset()  # Ensure clean start
+            # Initialize both demodulators
+            self.nbfm_demodulator = NBFMDemodulator(self.device.iq_sample_rate)
+            self.nbfm_demodulator.set_squelch(self.squelch_slider.value())
+            self.nbfm_demodulator.set_tuned_offset(self.tuned_freq - self.center_freq)
+            self.nbfm_demodulator.reset()
+
+            # Use stereo demodulator for FM broadcast (better audio quality)
+            self.wbfm_demodulator = WBFMStereoDemodulator(self.device.iq_sample_rate)
+            self.wbfm_demodulator.set_squelch(self.squelch_slider.value())
+            self.wbfm_demodulator.set_tuned_offset(self.tuned_freq - self.center_freq)
+            self.wbfm_demodulator.reset()
+
+            # Set active demodulator based on mode
+            self.demodulator = self.nbfm_demodulator if self.current_mode == self.MODE_WEATHER else self.wbfm_demodulator
 
             # Initialize audio output with initial volume from slider
-            self.audio_output = AudioOutput()
+            # Use mono for NBFM, stereo for WBFM
+            channels = 2 if self.current_mode == self.MODE_FM_BROADCAST else 1
+            self.audio_output = AudioOutput(channels=channels)
             self.audio_output.set_gain(self.volume_slider.value() / 50.0)
 
             # Start data acquisition thread
@@ -1000,6 +1456,34 @@ class MainWindow(QMainWindow):
         # Update S-meter display
         self.smeter.set_level(signal_db)
 
+        # Update stereo/SNR indicators if in FM Broadcast mode
+        if self.current_mode == self.MODE_FM_BROADCAST:
+            self._update_stereo_indicators()
+
+    def _update_stereo_indicators(self):
+        """Update stereo and SNR indicators from WBFM stereo demodulator."""
+        if not hasattr(self, 'wbfm_demodulator') or self.wbfm_demodulator is None:
+            return
+
+        # Update stereo indicator
+        if self.wbfm_demodulator.pilot_detected:
+            blend = self.wbfm_demodulator.stereo_blend_factor
+            if blend >= 0.9:
+                self.stereo_indicator.setText('STEREO')
+            elif blend <= 0.1:
+                self.stereo_indicator.setText('MONO')
+            else:
+                blend_pct = int(blend * 100)
+                self.stereo_indicator.setText(f'{blend_pct}%')
+        else:
+            self.stereo_indicator.setText('MONO')
+        self.stereo_indicator.setStyleSheet('font-family: monospace; color: black;')
+
+        # Update SNR indicator
+        snr = self.wbfm_demodulator.snr_db
+        self.snr_indicator.setText(f'{snr:2.0f} dB')
+        self.snr_indicator.setStyleSheet('font-family: monospace; color: black;')
+
     def tune(self, delta):
         """Change frequency by delta Hz."""
         new_freq = self.center_freq + delta
@@ -1037,7 +1521,10 @@ class MainWindow(QMainWindow):
 
             # Update UI
             self.freq_entry.setText(f'{freq/1e6:.3f}')
-            self.setWindowTitle(f"Phil's Weather Radio - {freq/1e6:.3f} MHz")
+            if self.current_mode == self.MODE_FM_BROADCAST:
+                self.setWindowTitle(f"FM Broadcast - {freq/1e6:.3f} MHz")
+            else:
+                self.setWindowTitle(f"Phil's Weather Radio - {freq/1e6:.3f} MHz")
 
             # Reset averaging on frequency change
             self.spectrum_avg = None
@@ -1078,11 +1565,115 @@ class MainWindow(QMainWindow):
             self.squelch_indicator.setText('◯')
             self.squelch_indicator.setStyleSheet('color: gray; font-size: 16px;')
 
+    def on_mode_changed(self, button):
+        """Handle mode radio button change."""
+        # Determine new mode from which button is checked
+        new_mode = self.MODE_WEATHER if self.weather_radio_btn.isChecked() else self.MODE_FM_BROADCAST
+        if new_mode == self.current_mode:
+            return
+
+        self.current_mode = new_mode
+
+        # Pause data thread during reconfiguration
+        if self.data_thread:
+            self.data_thread.pause()
+
+        # Get new frequency and sample rate for this mode
+        if new_mode == self.MODE_FM_BROADCAST:
+            new_freq = FM_BROADCAST_DEFAULT
+            new_sample_rate = FM_BROADCAST_SAMPLE_RATE
+            # Hide NOAA presets
+            self.noaa_label.hide()
+            for btn in self.noaa_buttons:
+                btn.hide()
+        else:
+            new_freq = DEFAULT_CENTER_FREQ
+            new_sample_rate = SAMPLE_RATE
+            # Show NOAA presets
+            self.noaa_label.show()
+            for btn in self.noaa_buttons:
+                btn.show()
+
+        # Reconfigure device with new sample rate and frequency
+        if self.device and self.device.streaming_mode:
+            self.device.configure_iq_streaming(new_freq, new_sample_rate)
+            self.bandwidth = self.device.iq_sample_rate
+            self.center_freq = new_freq
+
+        # Update spectrum and waterfall with new bandwidth
+        self.spectrum_widget.set_bandwidth(self.bandwidth)
+        self.spectrum_widget.set_center_freq(new_freq)
+        self.waterfall_widget.set_bandwidth(self.bandwidth)
+        self.waterfall_widget.set_center_freq(new_freq)
+
+        # Reset view to show full bandwidth
+        freq_start = (new_freq - self.bandwidth / 2) / 1e6
+        freq_end = (new_freq + self.bandwidth / 2) / 1e6
+        self.spectrum_widget.setXRange(freq_start, freq_end, padding=0)
+        self.waterfall_widget.plot.setXRange(freq_start, freq_end, padding=0)
+
+        # Recreate demodulators with new sample rate
+        self.nbfm_demodulator = NBFMDemodulator(self.bandwidth)
+        self.wbfm_demodulator = WBFMStereoDemodulator(self.bandwidth)
+
+        # Select the appropriate demodulator and audio channels
+        if new_mode == self.MODE_FM_BROADCAST:
+            self.demodulator = self.wbfm_demodulator
+            self.setWindowTitle(f"FM Broadcast - {new_freq/1e6:.3f} MHz")
+            # Switch to stereo audio output
+            if self.audio_output:
+                self.audio_output.set_channels(2)
+            # Show stereo/SNR indicators
+            self.stereo_label.show()
+            self.stereo_indicator.show()
+            self.snr_label.show()
+            self.snr_indicator.show()
+        else:
+            self.demodulator = self.nbfm_demodulator
+            self.setWindowTitle(f"Phil's Weather Radio - {new_freq/1e6:.3f} MHz")
+            # Switch to mono audio output
+            if self.audio_output:
+                self.audio_output.set_channels(1)
+            # Hide stereo/SNR indicators (not applicable for NBFM)
+            self.stereo_label.hide()
+            self.stereo_indicator.hide()
+            self.snr_label.hide()
+            self.snr_indicator.hide()
+
+        # Update tuned frequency to match center
+        self.tuned_freq = new_freq
+        self.spectrum_widget.set_tuned_freq(self.tuned_freq)
+        self.waterfall_widget.set_tuned_freq(self.tuned_freq)
+        self.tuned_freq_label.setText(f'{self.tuned_freq/1e6:.4f} MHz')
+
+        # Update UI
+        self.freq_entry.setText(f'{new_freq/1e6:.3f}')
+        self.status_label.setText(f'Running - {self.bandwidth/1e3:.1f} kHz')
+
+        # Configure demodulator
+        self.demodulator.set_squelch(self.squelch_slider.value())
+        self.demodulator.set_tuned_offset(0)
+        self.demodulator.reset()
+
+        # Update data thread with new demodulator and resume
+        if self.data_thread:
+            self.data_thread.set_demodulator(self.demodulator)
+            self.data_thread.resume()
+
+        # Reset spectrum averaging
+        self.spectrum_avg = None
+
+        # Update frequency button labels
+        self.update_freq_button_labels()
+
     def on_squelch_changed(self, value):
         """Handle squelch slider change."""
         self.squelch_value_label.setText(f'{value} dB')
-        if self.demodulator:
-            self.demodulator.set_squelch(value)
+        # Update both demodulators so switching modes preserves squelch setting
+        if self.nbfm_demodulator:
+            self.nbfm_demodulator.set_squelch(value)
+        if self.wbfm_demodulator:
+            self.wbfm_demodulator.set_squelch(value)
 
     def on_volume_changed(self, value):
         """Handle volume slider change."""
@@ -1094,8 +1685,9 @@ class MainWindow(QMainWindow):
 
     def on_tuning_clicked(self, freq_hz):
         """Handle click-to-tune on spectrum or waterfall."""
-        # Snap to nearest 25 kHz (NOAA weather channel spacing)
-        freq_hz = round(freq_hz / 25e3) * 25e3
+        # Snap to channel spacing based on mode
+        snap = self.get_freq_step()
+        freq_hz = round(freq_hz / snap) * snap
         self.tuned_freq = freq_hz
 
         # Update tuning indicator on both displays

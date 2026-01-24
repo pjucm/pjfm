@@ -448,6 +448,12 @@ class FMRadio:
     AUDIO_SAMPLE_RATE = 48000
     IQ_BLOCK_SIZE = 8192  # ~26.2ms budget at 312.5kHz
 
+    # Signal level calibration offset (dB)
+    # BB60D IQ samples need calibration to match true power in dBm.
+    # This offset was determined empirically by comparing to a calibrated
+    # spectrum analyzer. Adjust if your readings don't match.
+    SIGNAL_CAL_OFFSET_DB = -8.0
+
     # Config file path (in same directory as script)
     CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pyfm.cfg')
 
@@ -646,13 +652,19 @@ class FMRadio:
                 iq_subset = iq[::16]
                 mean_power = np.mean(iq_subset.real**2 + iq_subset.imag**2)
                 if mean_power > 0:
-                    dbm = 10 * np.log10(mean_power)
+                    # Apply calibration offset to convert raw IQ power to dBm
+                    dbm = 10 * np.log10(mean_power) + self.SIGNAL_CAL_OFFSET_DB
                 else:
                     dbm = -140.0
                 self.signal_dbm = dbm  # No lock needed for single float assignment
 
                 # Check squelch
                 squelched = self.squelch_enabled and dbm < self.squelch_threshold
+
+                # Demodulate FM using stereo decoder (handles mono signals gracefully)
+                t_demod_start = time.perf_counter()
+                audio = self.stereo_decoder.demodulate(iq)
+                t_demod_end = time.perf_counter()
 
                 # Auto mode: RDS is enabled when pilot is present
                 # (pilot = station has stereo/RDS capability)
@@ -666,11 +678,6 @@ class FMRadio:
                             self.rds_decoder.reset()
                     elif not pilot_present and self.rds_enabled:
                         self.rds_enabled = False
-
-                # Demodulate FM using stereo decoder (handles mono signals gracefully)
-                t_demod_start = time.perf_counter()
-                audio = self.stereo_decoder.demodulate(iq)
-                t_demod_end = time.perf_counter()
 
                 # Process RDS inline (no queue) for sample continuity
                 if self.rds_enabled and self.rds_decoder and self.stereo_decoder.last_baseband is not None:
