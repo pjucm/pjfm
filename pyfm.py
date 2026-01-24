@@ -6,6 +6,7 @@ All rights reserved.
 
 A command-line FM radio application that:
 - Receives FM broadcast signals (88-108 MHz) via BB60D
+- Receives NOAA Weather Radio (162.400-162.550 MHz) in NBFM mode
 - Demodulates FM audio in real-time
 - Plays audio through the default audio device
 - Allows frequency tuning via arrow keys
@@ -14,10 +15,18 @@ Usage:
     ./pyfm.py [frequency_mhz]
 
 Controls:
-    Left/Right arrows: Tune down/up by 100 kHz
-    1-5: Recall frequency preset
-    Shift+1-5 (!@#$%): Set preset to current frequency
-    q or ESC: Quit
+    Left/Right arrows: Tune down/up by 100 kHz (FM) or 25 kHz (Weather)
+    Up/Down arrows: Volume up/down
+    1-5: Recall frequency preset (FM mode)
+    1-7: Recall WX channel (Weather mode)
+    Shift+1-5 (!@#$%): Set preset to current frequency (FM mode)
+    w: Toggle Weather radio mode (NBFM for NWS)
+    r: Toggle RDS decoder (FM mode only)
+    b: Toggle bass boost
+    t: Toggle treble boost
+    a: Toggle spectrum analyzer
+    Q: Toggle squelch
+    q: Quit
 """
 
 import sys
@@ -54,8 +63,20 @@ except ImportError as e:
     print("Make sure bb60d.py is in the same directory and the BB API library is installed.")
     sys.exit(1)
 
-from demodulator import FMStereoDecoder
+from demodulator import FMStereoDecoder, NBFMDecoder
 from rds_decoder import RDSDecoder, pi_to_callsign
+
+
+# NOAA Weather Radio channels (NWS standard)
+WX_CHANNELS = {
+    1: 162.550e6,  # WX1
+    2: 162.400e6,  # WX2
+    3: 162.475e6,  # WX3
+    4: 162.425e6,  # WX4
+    5: 162.450e6,  # WX5
+    6: 162.500e6,  # WX6
+    7: 162.525e6,  # WX7
+}
 
 
 def dbm_to_s_meter(dbm):
@@ -515,6 +536,10 @@ class FMRadio:
         self._initial_bass_boost = True
         self._initial_treble_boost = True
 
+        # Weather radio mode (NBFM for NWS)
+        self.weather_mode = False
+        self.nbfm_decoder = None
+
         # Load saved config (presets and last frequency)
         self._load_config()
 
@@ -597,6 +622,13 @@ class FMRadio:
             self.stereo_decoder.treble_boost_enabled = self._initial_treble_boost
             self.rds_decoder = RDSDecoder(sample_rate=actual_rate)
 
+            # Create NBFM decoder for weather radio mode
+            self.nbfm_decoder = NBFMDecoder(
+                iq_sample_rate=actual_rate,
+                audio_sample_rate=self.AUDIO_SAMPLE_RATE,
+                deviation=5000  # 5 kHz deviation for NBFM
+            )
+
             self.audio_player.start()
             self.running = True
 
@@ -661,15 +693,20 @@ class FMRadio:
                 # Check squelch
                 squelched = self.squelch_enabled and dbm < self.squelch_threshold
 
-                # Demodulate FM using stereo decoder (handles mono signals gracefully)
+                # Demodulate FM using appropriate decoder
                 t_demod_start = time.perf_counter()
-                audio = self.stereo_decoder.demodulate(iq)
+                if self.weather_mode:
+                    # NBFM for weather radio
+                    audio = self.nbfm_decoder.demodulate(iq)
+                else:
+                    # Wideband FM stereo for broadcast
+                    audio = self.stereo_decoder.demodulate(iq)
                 t_demod_end = time.perf_counter()
 
-                # Auto mode: RDS is enabled when pilot is present
+                # Auto mode: RDS is enabled when pilot is present (FM broadcast only)
                 # (pilot = station has stereo/RDS capability)
                 # Don't enable RDS on noise - require signal above squelch threshold
-                if self.auto_mode_enabled and self.stereo_decoder:
+                if not self.weather_mode and self.auto_mode_enabled and self.stereo_decoder:
                     pilot_present = self.stereo_decoder.pilot_detected and dbm >= self.squelch_threshold
                     if pilot_present and not self.rds_enabled:
                         self.rds_enabled = True
@@ -679,8 +716,8 @@ class FMRadio:
                     elif not pilot_present and self.rds_enabled:
                         self.rds_enabled = False
 
-                # Process RDS inline (no queue) for sample continuity
-                if self.rds_enabled and self.rds_decoder and self.stereo_decoder.last_baseband is not None:
+                # Process RDS inline (no queue) for sample continuity (FM broadcast only)
+                if not self.weather_mode and self.rds_enabled and self.rds_decoder and self.stereo_decoder.last_baseband is not None:
                     t_rds_start = time.perf_counter()
                     self.rds_data = self.rds_decoder.process(
                         self.stereo_decoder.last_baseband,
@@ -725,77 +762,121 @@ class FMRadio:
         return None
 
     def tune_up(self):
-        """Tune up by 100 kHz."""
+        """Tune up by 100 kHz (FM) or 25 kHz (Weather)."""
         self.is_tuning = True
         self.error_message = None
         with self.tuning_lock:
-            self.device.tune_up()
-            self.stereo_decoder.reset()
-            if self.rds_decoder:
-                self.rds_decoder.reset()
-                self.rds_data = {}
+            if self.weather_mode:
+                # Weather: 25 kHz steps within 162.400-162.550 MHz
+                new_freq = self.device.frequency + 25000
+                if new_freq > 162.550e6:
+                    new_freq = 162.400e6  # Wrap around
+                self.device.frequency = new_freq
+                self.device.configure_iq_streaming(new_freq, self.IQ_SAMPLE_RATE)
+                self.nbfm_decoder.reset()
+            else:
+                # FM broadcast: 100 kHz steps
+                self.device.tune_up()
+                self.stereo_decoder.reset()
+                if self.rds_decoder:
+                    self.rds_decoder.reset()
+                    self.rds_data = {}
             self.audio_player.reset()  # Refill buffer after tuning
         self.is_tuning = False
-        self._save_config()
+        if not self.weather_mode:
+            self._save_config()
 
     def tune_down(self):
-        """Tune down by 100 kHz."""
+        """Tune down by 100 kHz (FM) or 25 kHz (Weather)."""
         self.is_tuning = True
         self.error_message = None
         with self.tuning_lock:
-            self.device.tune_down()
-            self.stereo_decoder.reset()
-            if self.rds_decoder:
-                self.rds_decoder.reset()
-                self.rds_data = {}
+            if self.weather_mode:
+                # Weather: 25 kHz steps within 162.400-162.550 MHz
+                new_freq = self.device.frequency - 25000
+                if new_freq < 162.400e6:
+                    new_freq = 162.550e6  # Wrap around
+                self.device.frequency = new_freq
+                self.device.configure_iq_streaming(new_freq, self.IQ_SAMPLE_RATE)
+                self.nbfm_decoder.reset()
+            else:
+                # FM broadcast: 100 kHz steps
+                self.device.tune_down()
+                self.stereo_decoder.reset()
+                if self.rds_decoder:
+                    self.rds_decoder.reset()
+                    self.rds_data = {}
             self.audio_player.reset()  # Refill buffer after tuning
         self.is_tuning = False
-        self._save_config()
+        if not self.weather_mode:
+            self._save_config()
 
     def tune_to(self, freq_hz):
         """Tune to a specific frequency in Hz."""
-        if not (88.0e6 <= freq_hz <= 108.0e6):
-            return False
+        if self.weather_mode:
+            # Weather mode: 162.400-162.550 MHz
+            if not (162.400e6 <= freq_hz <= 162.550e6):
+                return False
+        else:
+            # FM broadcast: 88-108 MHz
+            if not (88.0e6 <= freq_hz <= 108.0e6):
+                return False
         self.is_tuning = True
         self.error_message = None
         with self.tuning_lock:
             self.device.frequency = freq_hz
             self.device.configure_iq_streaming(freq_hz, self.IQ_SAMPLE_RATE)
-            self.stereo_decoder.reset()
-            if self.rds_decoder:
-                self.rds_decoder.reset()
-                self.rds_data = {}
+            if self.weather_mode:
+                self.nbfm_decoder.reset()
+            else:
+                self.stereo_decoder.reset()
+                if self.rds_decoder:
+                    self.rds_decoder.reset()
+                    self.rds_data = {}
             self.audio_player.reset()  # Refill buffer after tuning
         self.is_tuning = False
-        self._save_config()
+        if not self.weather_mode:
+            self._save_config()
         return True
 
     def set_preset(self, preset_num):
         """
-        Set a preset (1-5) to the current frequency.
+        Set a preset (1-5) to the current frequency (FM mode only).
 
         Args:
             preset_num: Preset number 1-5
         """
+        if self.weather_mode:
+            return  # No user presets in weather mode
         if 1 <= preset_num <= 5:
             self.presets[preset_num - 1] = self.device.frequency
             self._save_config()
 
     def recall_preset(self, preset_num):
         """
-        Recall a preset (1-5) and tune to that frequency.
+        Recall a preset and tune to that frequency.
+
+        In FM mode: presets 1-5 are user-defined.
+        In Weather mode: presets 1-7 are fixed NWS channels.
 
         Args:
-            preset_num: Preset number 1-5
+            preset_num: Preset number 1-5 (FM) or 1-7 (Weather)
 
         Returns:
-            True if preset was recalled, False if preset is empty
+            True if preset was recalled, False if preset is empty/invalid
         """
-        if 1 <= preset_num <= 5:
-            freq = self.presets[preset_num - 1]
-            if freq is not None:
-                return self.tune_to(freq)
-        return False
+        if self.weather_mode:
+            # Weather mode: fixed NWS channels 1-7
+            if preset_num in WX_CHANNELS:
+                return self.tune_to(WX_CHANNELS[preset_num])
+            return False
+        else:
+            # FM mode: user presets 1-5
+            if 1 <= preset_num <= 5:
+                freq = self.presets[preset_num - 1]
+                if freq is not None:
+                    return self.tune_to(freq)
+            return False
 
     def toggle_spectrum(self):
         """Toggle spectrum analyzer on/off."""
@@ -820,13 +901,17 @@ class FMRadio:
 
     def toggle_bass_boost(self):
         """Toggle bass boost on/off."""
-        if self.stereo_decoder:
+        if self.weather_mode and self.nbfm_decoder:
+            self.nbfm_decoder.bass_boost_enabled = not self.nbfm_decoder.bass_boost_enabled
+        elif self.stereo_decoder:
             self.stereo_decoder.bass_boost_enabled = not self.stereo_decoder.bass_boost_enabled
             self._save_config()
 
     def toggle_treble_boost(self):
         """Toggle treble boost on/off."""
-        if self.stereo_decoder:
+        if self.weather_mode and self.nbfm_decoder:
+            self.nbfm_decoder.treble_boost_enabled = not self.nbfm_decoder.treble_boost_enabled
+        elif self.stereo_decoder:
             self.stereo_decoder.treble_boost_enabled = not self.stereo_decoder.treble_boost_enabled
             self._save_config()
 
@@ -848,6 +933,46 @@ class FMRadio:
                 return "enabled"
         return None
 
+    def toggle_weather_mode(self):
+        """Toggle between FM broadcast and Weather radio modes."""
+        self.is_tuning = True
+        self.error_message = None
+        self.weather_mode = not self.weather_mode
+
+        with self.tuning_lock:
+            if self.weather_mode:
+                # Switch to weather mode: tune to WX1 (162.550 MHz)
+                freq = WX_CHANNELS[1]
+                self.device.frequency = freq
+                self.device.configure_iq_streaming(freq, self.IQ_SAMPLE_RATE)
+                self.nbfm_decoder.reset()
+                # Disable RDS in weather mode
+                self.rds_enabled = False
+                self.rds_data = {}
+            else:
+                # Switch to FM mode: restore last FM frequency from config
+                freq = 89.9e6  # Default
+                config_path = self.CONFIG_FILE
+                if os.path.exists(config_path):
+                    config = configparser.ConfigParser()
+                    try:
+                        config.read(config_path)
+                        if config.has_option('radio', 'last_frequency'):
+                            freq_mhz = config.getfloat('radio', 'last_frequency')
+                            if 88.0 <= freq_mhz <= 108.0:
+                                freq = freq_mhz * 1e6
+                    except (ValueError, configparser.Error):
+                        pass
+                self.device.frequency = freq
+                self.device.configure_iq_streaming(freq, self.IQ_SAMPLE_RATE)
+                self.stereo_decoder.reset()
+                if self.rds_decoder:
+                    self.rds_decoder.reset()
+
+            self.audio_player.reset()
+
+        self.is_tuning = False
+
     @property
     def is_squelched(self):
         """Returns True if audio is currently squelched."""
@@ -855,7 +980,9 @@ class FMRadio:
 
     @property
     def pilot_detected(self):
-        """Returns True if 19 kHz stereo pilot tone is detected."""
+        """Returns True if 19 kHz stereo pilot tone is detected (FM mode only)."""
+        if self.weather_mode:
+            return False  # No pilot in NBFM
         # Don't report pilot on noise - require signal above squelch threshold
         if self.signal_dbm < self.squelch_threshold:
             return False
@@ -866,6 +993,8 @@ class FMRadio:
     @property
     def snr_db(self):
         """Return the current audio SNR estimate in dB."""
+        if self.weather_mode and self.nbfm_decoder:
+            return self.nbfm_decoder.snr_db
         if self.stereo_decoder:
             return self.stereo_decoder.snr_db
         return 0.0
@@ -873,6 +1002,8 @@ class FMRadio:
     @property
     def peak_amplitude(self):
         """Return peak audio amplitude (before limiting). >1.0 means limiter active."""
+        if self.weather_mode and self.nbfm_decoder:
+            return self.nbfm_decoder.peak_amplitude
         if self.stereo_decoder:
             return self.stereo_decoder.peak_amplitude
         return 0.0
@@ -880,6 +1011,8 @@ class FMRadio:
     @property
     def stereo_blend_factor(self):
         """Return stereo blend factor (0=mono, 1=full stereo)."""
+        if self.weather_mode:
+            return 0.0  # Always mono in weather mode
         if self.stereo_decoder:
             return self.stereo_decoder.stereo_blend_factor
         return 0.0
@@ -892,6 +1025,8 @@ class FMRadio:
     @property
     def bass_boost_enabled(self):
         """Returns True if bass boost is enabled."""
+        if self.weather_mode and self.nbfm_decoder:
+            return self.nbfm_decoder.bass_boost_enabled
         if self.stereo_decoder:
             return self.stereo_decoder.bass_boost_enabled
         return False
@@ -899,6 +1034,8 @@ class FMRadio:
     @property
     def treble_boost_enabled(self):
         """Returns True if treble boost is enabled."""
+        if self.weather_mode and self.nbfm_decoder:
+            return self.nbfm_decoder.treble_boost_enabled
         if self.stereo_decoder:
             return self.stereo_decoder.treble_boost_enabled
         return False
@@ -961,6 +1098,14 @@ def render_band_indicator(freq_mhz, min_freq=88.0, max_freq=108.0, width=30):
     return indicator
 
 
+def get_wx_channel_name(freq_hz):
+    """Get the WX channel name for a frequency."""
+    for ch, f in WX_CHANNELS.items():
+        if abs(f - freq_hz) < 1000:  # Within 1 kHz tolerance
+            return f"WX{ch}"
+    return None
+
+
 def build_display(radio, width=80):
     """Build the rich display panel."""
     freq = radio.frequency_mhz
@@ -973,10 +1118,19 @@ def build_display(radio, width=80):
     table.add_column("Value", style="green bold")
 
     # Frequency row
-    table.add_row("Frequency:", f"{freq:.1f} MHz")
+    freq_text = Text()
+    freq_text.append(f"{freq:.3f} MHz", style="green bold")
+    if radio.weather_mode:
+        wx_ch = get_wx_channel_name(radio.device.frequency)
+        if wx_ch:
+            freq_text.append(f"  ({wx_ch})", style="cyan bold")
+    table.add_row("Frequency:", freq_text)
 
     # Mode row
-    table.add_row("Mode:", "IQ Streaming + Software FM Demod")
+    if radio.weather_mode:
+        table.add_row("Mode:", "NBFM Weather Radio (5 kHz dev)")
+    else:
+        table.add_row("Mode:", "Wideband FM Stereo (75 kHz dev)")
 
     # Volume row
     vol_pct = int(radio.volume * 100)
@@ -993,26 +1147,46 @@ def build_display(radio, width=80):
     signal_text.append(f"  ({signal_dbm:6.1f} dBm)", style="yellow")
     table.add_row("Signal:", signal_text)
 
-    # SNR row
+    # SNR row - different thresholds for NBFM vs WBFM
     snr = radio.snr_db
     snr_text = Text()
-    if snr > 40:
-        snr_text.append(f"{snr:.1f} dB", style="green bold")
-        snr_text.append("  (Excellent)", style="green")
-    elif snr > 30:
-        snr_text.append(f"{snr:.1f} dB", style="green bold")
-        snr_text.append("  (Good)", style="green")
-    elif snr > 20:
-        snr_text.append(f"{snr:.1f} dB", style="yellow bold")
-        snr_text.append("  (Fair)", style="yellow")
-    elif snr > 10:
-        snr_text.append(f"{snr:.1f} dB", style="yellow bold")
-        snr_text.append("  (Poor)", style="yellow")
+    if radio.weather_mode:
+        # NBFM voice thresholds (3 kHz audio bandwidth)
+        # Voice is intelligible at much lower SNR than music
+        if snr > 15:
+            snr_text.append(f"{snr:.1f} dB", style="green bold")
+            snr_text.append("  (Excellent)", style="green")
+        elif snr > 10:
+            snr_text.append(f"{snr:.1f} dB", style="green bold")
+            snr_text.append("  (Good)", style="green")
+        elif snr > 6:
+            snr_text.append(f"{snr:.1f} dB", style="yellow bold")
+            snr_text.append("  (Fair)", style="yellow")
+        elif snr > 3:
+            snr_text.append(f"{snr:.1f} dB", style="yellow bold")
+            snr_text.append("  (Poor)", style="yellow")
+        else:
+            snr_text.append(f"{snr:.1f} dB", style="red bold")
+            snr_text.append("  (Very Poor)", style="red")
+        bw_label = "3kHz"
     else:
-        snr_text.append(f"{snr:.1f} dB", style="red bold")
-        snr_text.append("  (Very Poor)", style="red")
-    # Indicate bandwidth used for SNR calculation
-    bw_label = "53kHz" if radio.pilot_detected else "15kHz"
+        # WBFM broadcast thresholds (15-53 kHz audio bandwidth)
+        if snr > 40:
+            snr_text.append(f"{snr:.1f} dB", style="green bold")
+            snr_text.append("  (Excellent)", style="green")
+        elif snr > 30:
+            snr_text.append(f"{snr:.1f} dB", style="green bold")
+            snr_text.append("  (Good)", style="green")
+        elif snr > 20:
+            snr_text.append(f"{snr:.1f} dB", style="yellow bold")
+            snr_text.append("  (Fair)", style="yellow")
+        elif snr > 10:
+            snr_text.append(f"{snr:.1f} dB", style="yellow bold")
+            snr_text.append("  (Poor)", style="yellow")
+        else:
+            snr_text.append(f"{snr:.1f} dB", style="red bold")
+            snr_text.append("  (Very Poor)", style="red")
+        bw_label = "53kHz" if radio.pilot_detected else "15kHz"
     snr_text.append(f"  [{bw_label}]", style="dim")
     table.add_row("SNR:", snr_text)
 
@@ -1031,17 +1205,27 @@ def build_display(radio, width=80):
     # Band position
     table.add_row("", "")  # Spacer
     band_text = Text()
-    band_text.append("88", style="yellow")
-    band_text.append(" ", style="")
-    band_text.append(render_band_indicator(freq, width=30))
-    band_text.append(" ", style="")
-    band_text.append("108", style="yellow")
+    if radio.weather_mode:
+        band_text.append("162.4", style="yellow")
+        band_text.append(" ", style="")
+        band_text.append(render_band_indicator(freq, min_freq=162.4, max_freq=162.55, width=30))
+        band_text.append(" ", style="")
+        band_text.append("162.55", style="yellow")
+    else:
+        band_text.append("88", style="yellow")
+        band_text.append(" ", style="")
+        band_text.append(render_band_indicator(freq, width=30))
+        band_text.append(" ", style="")
+        band_text.append("108", style="yellow")
     table.add_row("Band:", band_text)
 
     # Stereo status (stereo decoder always active, shows pilot detection status)
     table.add_row("", "")  # Spacer
     stereo_text = Text()
-    if radio.pilot_detected:
+    if radio.weather_mode:
+        stereo_text.append("Mono", style="cyan bold")
+        stereo_text.append(" (NBFM)", style="dim")
+    elif radio.pilot_detected:
         blend = radio.stereo_blend_factor
         if blend >= 0.99:
             stereo_text.append("Stereo", style="green bold")
@@ -1058,39 +1242,42 @@ def build_display(radio, width=80):
         stereo_text.append(" (no pilot)", style="dim")
     table.add_row("Audio:", stereo_text)
 
-    # RDS data display (always shown to prevent UI pumping)
-    rds_snapshot = dict(radio.rds_data) if radio.rds_data else {}
-    ps_name = rds_snapshot.get('station_name', '') if radio.rds_enabled else ''
-    pty = rds_snapshot.get('program_type', '') if radio.rds_enabled else ''
-    pi_hex = rds_snapshot.get('pi_hex') if radio.rds_enabled else None
-    radio_text_val = rds_snapshot.get('radio_text', '') if radio.rds_enabled else ''
-    clock_time = rds_snapshot.get('clock_time', '') if radio.rds_enabled else ''
+    # RDS data display (FM mode only - hidden in weather mode)
+    if not radio.weather_mode:
+        rds_snapshot = dict(radio.rds_data) if radio.rds_data else {}
+        ps_name = rds_snapshot.get('station_name', '') if radio.rds_enabled else ''
+        pty = rds_snapshot.get('program_type', '') if radio.rds_enabled else ''
+        pi_hex = rds_snapshot.get('pi_hex') if radio.rds_enabled else None
+        radio_text_val = rds_snapshot.get('radio_text', '') if radio.rds_enabled else ''
+        clock_time = rds_snapshot.get('clock_time', '') if radio.rds_enabled else ''
 
-    # Station line: Callsign [Genre]
-    callsign = pi_to_callsign(pi_hex) if pi_hex else None
-    station_info = Text()
-    if callsign:
-        station_info.append(callsign, style="cyan bold")
-    elif pi_hex:
-        station_info.append(f"PI:{pi_hex}", style="cyan")
-    if pty and pty != "None":
-        if callsign or pi_hex:
-            station_info.append("  ", style="")
-        station_info.append(f"({pty})", style="yellow")
-    table.add_row("Station:", station_info)
+        # Station line: Callsign [Genre]
+        callsign = pi_to_callsign(pi_hex) if pi_hex else None
+        station_info = Text()
+        if callsign:
+            station_info.append(callsign, style="cyan bold")
+        elif pi_hex:
+            station_info.append(f"PI:{pi_hex}", style="cyan")
+        if pty and pty != "None":
+            if callsign or pi_hex:
+                station_info.append("  ", style="")
+            station_info.append(f"({pty})", style="yellow")
+        table.add_row("Station:", station_info)
 
-    # Name line: PS (station branding)
-    ps_text = Text(ps_name, style="green bold") if ps_name else Text()
-    table.add_row("Name:", ps_text)
+        # Name line: PS (station branding)
+        ps_text = Text(ps_name, style="green bold") if ps_name else Text()
+        table.add_row("Name:", ps_text)
 
-    # Radio text line (64 chars per RDS spec, left-justified to prevent layout shift)
-    rt_display = radio_text_val[:64].ljust(64) if radio_text_val else " " * 64
-    rt_text = Text(rt_display, style="green")
-    table.add_row("Text:", rt_text)
+        # Radio text line (64 chars per RDS spec, left-justified to prevent layout shift)
+        rt_display = radio_text_val[:64].ljust(64) if radio_text_val else " " * 64
+        rt_text = Text(rt_display, style="green")
+        table.add_row("Text:", rt_text)
 
-    # Clock time line
-    ct_text = Text(clock_time, style="magenta") if clock_time else Text()
-    table.add_row("Time:", ct_text)
+        # Clock time line
+        ct_text = Text(clock_time, style="magenta") if clock_time else Text()
+        table.add_row("Time:", ct_text)
+    else:
+        rds_snapshot = {}  # For RDS status section below
 
     table.add_row("", "")  # Spacer
 
@@ -1125,31 +1312,32 @@ def build_display(radio, width=80):
         tone_text.append("Treble OFF", style="dim")
     table.add_row("Boost:", tone_text)
 
-    # RDS status (rds_snapshot already obtained above)
-    rds_text = Text()
-    if radio.rds_enabled:
-        rds_text.append("ON", style="green bold")
-        if rds_snapshot.get('synced'):
-            rds_text.append("  [SYNC]", style="green")
+    # RDS status (FM mode only)
+    if not radio.weather_mode:
+        rds_text = Text()
+        if radio.rds_enabled:
+            rds_text.append("ON", style="green bold")
+            if rds_snapshot.get('synced'):
+                rds_text.append("  [SYNC]", style="green")
+            else:
+                rds_text.append("  [SRCH]", style="yellow")
+            # Show detailed stats only in debug mode
+            if radio.show_buffer_stats:
+                groups = rds_snapshot.get('groups_received', 0)
+                block_rate = rds_snapshot.get('block_rate', 0)
+                corrected = rds_snapshot.get('blocks_corrected', 0)
+                sig_level = rds_snapshot.get('signal_level', 0)
+                timing_range = rds_snapshot.get('timing_range', (0, 0))
+                freq_offset = rds_snapshot.get('timing_freq_offset', 0)
+                # freq_offset in samples/symbol - show as Hz offset from nominal 1187.5 Hz
+                # effective_rate = sample_rate / (sps_nominal + freq_offset)
+                # For small offsets: delta_Hz ≈ -freq_offset * symbol_rate^2 / sample_rate
+                sample_rate = rds_snapshot.get('sample_rate', 250000)
+                delta_hz = -freq_offset * (1187.5 ** 2) / sample_rate
+                rds_text.append(f"  grp:{groups} blk:{block_rate:.0%} cor:{corrected} sig:{sig_level:.3f} tau:{timing_range[0]:.2f}/{timing_range[1]:.2f} df:{delta_hz:+.2f}Hz", style="dim")
         else:
-            rds_text.append("  [SRCH]", style="yellow")
-        # Show detailed stats only in debug mode
-        if radio.show_buffer_stats:
-            groups = rds_snapshot.get('groups_received', 0)
-            block_rate = rds_snapshot.get('block_rate', 0)
-            corrected = rds_snapshot.get('blocks_corrected', 0)
-            sig_level = rds_snapshot.get('signal_level', 0)
-            timing_range = rds_snapshot.get('timing_range', (0, 0))
-            freq_offset = rds_snapshot.get('timing_freq_offset', 0)
-            # freq_offset in samples/symbol - show as Hz offset from nominal 1187.5 Hz
-            # effective_rate = sample_rate / (sps_nominal + freq_offset)
-            # For small offsets: delta_Hz ≈ -freq_offset * symbol_rate^2 / sample_rate
-            sample_rate = rds_snapshot.get('sample_rate', 250000)
-            delta_hz = -freq_offset * (1187.5 ** 2) / sample_rate
-            rds_text.append(f"  grp:{groups} blk:{block_rate:.0%} cor:{corrected} sig:{sig_level:.3f} tau:{timing_range[0]:.2f}/{timing_range[1]:.2f} df:{delta_hz:+.2f}Hz", style="dim")
-    else:
-        rds_text.append("OFF", style="dim")
-    table.add_row("RDS:", rds_text)
+            rds_text.append("OFF", style="dim")
+        table.add_row("RDS:", rds_text)
 
     # Performance stats (disabled - only show sample loss if it occurs)
     sample_loss = getattr(radio.device, 'total_sample_loss', 0)
@@ -1254,8 +1442,11 @@ def build_display(radio, width=80):
     controls.append("Tune  ", style="dim")
     controls.append("↑/↓ ", style="cyan bold")
     controls.append("Vol  ", style="dim")
-    controls.append("r ", style="cyan bold")
-    controls.append("RDS  ", style="dim")
+    controls.append("w ", style="cyan bold")
+    controls.append("WX  ", style="dim")
+    if not radio.weather_mode:
+        controls.append("r ", style="cyan bold")
+        controls.append("RDS  ", style="dim")
     controls.append("b ", style="cyan bold")
     controls.append("Bass  ", style="dim")
     controls.append("t ", style="cyan bold")
@@ -1269,21 +1460,37 @@ def build_display(radio, width=80):
 
     # Presets section
     presets = Text()
-    presets.append("\nPresets: ", style="yellow bold")
-    for i, preset_freq in enumerate(radio.presets, 1):
-        presets.append(f"{i}", style="cyan bold")
-        presets.append(":", style="dim")
-        if preset_freq is not None:
-            freq_mhz = preset_freq / 1e6
+    if radio.weather_mode:
+        # Weather mode: show WX1-WX7 presets
+        presets.append("\nChannels: ", style="yellow bold")
+        for ch in range(1, 8):
+            wx_freq = WX_CHANNELS[ch]
+            presets.append(f"{ch}", style="cyan bold")
+            presets.append(":", style="dim")
+            freq_mhz = wx_freq / 1e6
             # Highlight if this is the current frequency
-            if abs(freq_mhz - freq) < 0.05:
-                presets.append(f"{freq_mhz:.1f}", style="green bold")
+            if abs(freq_mhz - freq) < 0.02:
+                presets.append(f"WX{ch}", style="green bold")
             else:
-                presets.append(f"{freq_mhz:.1f}", style="white")
-        else:
-            presets.append("---", style="dim")
-        presets.append("  ", style="")
-    presets.append("  (Shift+# to set)", style="dim")
+                presets.append(f"WX{ch}", style="white")
+            presets.append("  ", style="")
+    else:
+        # FM mode: show user presets 1-5
+        presets.append("\nPresets: ", style="yellow bold")
+        for i, preset_freq in enumerate(radio.presets, 1):
+            presets.append(f"{i}", style="cyan bold")
+            presets.append(":", style="dim")
+            if preset_freq is not None:
+                freq_mhz = preset_freq / 1e6
+                # Highlight if this is the current frequency
+                if abs(freq_mhz - freq) < 0.05:
+                    presets.append(f"{freq_mhz:.1f}", style="green bold")
+                else:
+                    presets.append(f"{freq_mhz:.1f}", style="white")
+            else:
+                presets.append("---", style="dim")
+            presets.append("  ", style="")
+        presets.append("  (Shift+# to set)", style="dim")
 
     # Build final layout (centered)
     content = Table.grid(expand=True)
@@ -1312,10 +1519,17 @@ def build_display(radio, width=80):
     content.add_row(Align.center(controls))
     content.add_row(Align.center(presets))
 
+    if radio.weather_mode:
+        panel_title = "[bold yellow]🌦️ pyfm[/] [dim]- NOAA Weather Radio[/]"
+        border_style = "yellow"
+    else:
+        panel_title = "[bold cyan]📻 pyfm[/] [dim]- SignalHound BB60D FM Receiver[/]"
+        border_style = "cyan"
+
     panel = Panel(
         content,
-        title="[bold cyan]📻 pyfm[/] [dim]- SignalHound BB60D FM Receiver[/]",
-        border_style="cyan",
+        title=panel_title,
+        border_style=border_style,
         box=box.ROUNDED,
         padding=(1, 2),
     )
@@ -1408,9 +1622,14 @@ def run_rich_ui(radio):
                         # Toggle spectrum analyzer
                         radio.toggle_spectrum()
                         input_buffer = input_buffer[1:]
+                    elif input_buffer[0] in ('w', 'W'):
+                        # Toggle weather mode
+                        radio.toggle_weather_mode()
+                        input_buffer = input_buffer[1:]
                     elif input_buffer[0] in ('r', 'R'):
-                        # Toggle RDS decoder
-                        radio.toggle_rds()
+                        # Toggle RDS decoder (FM mode only)
+                        if not radio.weather_mode:
+                            radio.toggle_rds()
                         input_buffer = input_buffer[1:]
                     elif input_buffer[0] in ('b', 'B'):
                         # Toggle bass boost
@@ -1429,16 +1648,23 @@ def run_rich_ui(radio):
                         result = radio.toggle_rds_diagnostics()
                         # Result shown via normal display update
                         input_buffer = input_buffer[1:]
-                    elif input_buffer[0] in '12345':
-                        # Recall preset
+                    elif input_buffer[0] in '1234567':
+                        # Recall preset (1-5 for FM, 1-7 for Weather)
                         preset_num = int(input_buffer[0])
-                        radio.recall_preset(preset_num)
+                        if radio.weather_mode:
+                            # Weather mode: 1-7 are WX channels
+                            radio.recall_preset(preset_num)
+                        else:
+                            # FM mode: 1-5 are user presets
+                            if preset_num <= 5:
+                                radio.recall_preset(preset_num)
                         input_buffer = input_buffer[1:]
                     elif input_buffer[0] in '!@#$%':
-                        # Set preset (shift+1-5)
-                        preset_map = {'!': 1, '@': 2, '#': 3, '$': 4, '%': 5}
-                        preset_num = preset_map[input_buffer[0]]
-                        radio.set_preset(preset_num)
+                        # Set preset (shift+1-5) - FM mode only
+                        if not radio.weather_mode:
+                            preset_map = {'!': 1, '@': 2, '#': 3, '$': 4, '%': 5}
+                            preset_num = preset_map[input_buffer[0]]
+                            radio.set_preset(preset_num)
                         input_buffer = input_buffer[1:]
                     else:
                         # Unknown character - skip it

@@ -140,6 +140,10 @@ class BB60D:
     FM_MAX_FREQ = 108.0e6
     FM_STEP = 100e3  # 100 kHz step
 
+    # Full device frequency range (BB60D supports 9 kHz to 6.4 GHz)
+    MIN_FREQ = BB_MIN_FREQ  # 9 kHz
+    MAX_FREQ = BB_MAX_FREQ  # 6.4 GHz
+
     # Default frequency
     DEFAULT_FREQ = 89.9e6
 
@@ -204,7 +208,8 @@ class BB60D:
         if freq is not None:
             self.frequency = freq
 
-        self.frequency = max(self.FM_MIN_FREQ, min(self.FM_MAX_FREQ, self.frequency))
+        # Clamp to full device range (not just FM band)
+        self.frequency = max(self.MIN_FREQ, min(self.MAX_FREQ, self.frequency))
 
         # Calculate decimation factor
         # BB60D base rate is 40 MHz, decimation must be power of 2
@@ -296,7 +301,8 @@ class BB60D:
         Args:
             freq: New frequency in Hz
         """
-        self.frequency = max(self.FM_MIN_FREQ, min(self.FM_MAX_FREQ, freq))
+        # Clamp to full device range (not just FM band)
+        self.frequency = max(self.MIN_FREQ, min(self.MAX_FREQ, freq))
 
         # Reconfigure IQ streaming with new frequency
         if self.streaming_mode == "iq":

@@ -578,6 +578,239 @@ class FMStereoDecoder:
         self.treble_state_r = signal.lfilter_zi(self.treble_b, self.treble_a)
 
 
+class NBFMDecoder:
+    """
+    Narrowband FM decoder for weather radio and similar services.
+
+    NBFM characteristics:
+    - Deviation: ~5 kHz (vs 75 kHz for broadcast FM)
+    - Mono only (no stereo subcarrier)
+    - Audio bandwidth: ~3 kHz
+    - No de-emphasis (NWS transmits without pre-emphasis)
+    """
+
+    def __init__(self, iq_sample_rate=250000, audio_sample_rate=48000,
+                 deviation=5000):
+        """
+        Initialize NBFM decoder.
+
+        Args:
+            iq_sample_rate: Input IQ sample rate in Hz
+            audio_sample_rate: Output audio sample rate in Hz
+            deviation: FM deviation in Hz (5 kHz typical for NBFM)
+        """
+        self.iq_sample_rate = iq_sample_rate
+        self.audio_sample_rate = audio_sample_rate
+        self.deviation = deviation
+
+        # State for continuous processing
+        self.last_sample = complex(1, 0)
+
+        # Calculate resampling ratio
+        from math import gcd
+        iq_int = int(iq_sample_rate)
+        audio_int = int(audio_sample_rate)
+        g = gcd(iq_int, audio_int)
+        self.resample_up = audio_int // g
+        self.resample_down = iq_int // g
+
+        # Design filters (all at IQ sample rate)
+        nyq = iq_sample_rate / 2
+
+        # Audio lowpass filter (3 kHz for NBFM voice)
+        audio_cutoff = 3000 / nyq
+        self.audio_lpf = signal.firwin(101, audio_cutoff, window='hamming')
+        self.audio_lpf_state = signal.lfilter_zi(self.audio_lpf, 1.0)
+
+        # SNR measurement state
+        self._snr_db = 0.0
+        self._signal_power = 0.0
+        self._noise_power = 1e-10
+
+        # Design noise measurement bandpass filter (20-30 kHz)
+        # Must be well outside NBFM signal bandwidth (Carson's rule: 2*(5kHz + 3kHz) = 16kHz)
+        # Using 20-30kHz to be safely outside the signal spectrum
+        noise_low = 20000 / nyq
+        noise_high = min(30000 / nyq, 0.95)
+        if noise_high > noise_low:
+            self.noise_bpf = signal.firwin(51, [noise_low, noise_high],
+                                           pass_zero=False, window='hamming')
+            self.noise_bpf_state = signal.lfilter_zi(self.noise_bpf, 1.0)
+            self.noise_bandwidth = 10000  # Hz
+        else:
+            self.noise_bpf = None
+
+        # Audio bandwidth for SNR scaling
+        self.audio_bandwidth = 3000  # Hz
+
+        # Peak amplitude tracking
+        self._peak_amplitude = 0.0
+
+        # Tone controls (bass and treble boost) - same as stereo decoder
+        self.bass_boost_enabled = False   # Default off for weather
+        self.treble_boost_enabled = False # Default off for weather
+        self._setup_tone_filters()
+
+    def _design_low_shelf(self, fc, gain_db, fs):
+        """Design low shelf biquad filter coefficients."""
+        A = 10 ** (gain_db / 40)
+        w0 = 2 * np.pi * fc / fs
+        alpha = np.sin(w0) / 2 * np.sqrt(2)
+        cos_w0 = np.cos(w0)
+        sqrt_A = np.sqrt(A)
+        two_sqrt_A_alpha = 2 * sqrt_A * alpha
+
+        b0 = A * ((A + 1) - (A - 1) * cos_w0 + two_sqrt_A_alpha)
+        b1 = 2 * A * ((A - 1) - (A + 1) * cos_w0)
+        b2 = A * ((A + 1) - (A - 1) * cos_w0 - two_sqrt_A_alpha)
+        a0 = (A + 1) + (A - 1) * cos_w0 + two_sqrt_A_alpha
+        a1 = -2 * ((A - 1) + (A + 1) * cos_w0)
+        a2 = (A + 1) + (A - 1) * cos_w0 - two_sqrt_A_alpha
+
+        b = np.array([b0/a0, b1/a0, b2/a0])
+        a = np.array([1.0, a1/a0, a2/a0])
+        return b, a
+
+    def _design_high_shelf(self, fc, gain_db, fs):
+        """Design high shelf biquad filter coefficients."""
+        A = 10 ** (gain_db / 40)
+        w0 = 2 * np.pi * fc / fs
+        alpha = np.sin(w0) / 2 * np.sqrt(2)
+        cos_w0 = np.cos(w0)
+        sqrt_A = np.sqrt(A)
+        two_sqrt_A_alpha = 2 * sqrt_A * alpha
+
+        b0 = A * ((A + 1) + (A - 1) * cos_w0 + two_sqrt_A_alpha)
+        b1 = -2 * A * ((A - 1) + (A + 1) * cos_w0)
+        b2 = A * ((A + 1) + (A - 1) * cos_w0 - two_sqrt_A_alpha)
+        a0 = (A + 1) - (A - 1) * cos_w0 + two_sqrt_A_alpha
+        a1 = 2 * ((A - 1) - (A + 1) * cos_w0)
+        a2 = (A + 1) - (A - 1) * cos_w0 - two_sqrt_A_alpha
+
+        b = np.array([b0/a0, b1/a0, b2/a0])
+        a = np.array([1.0, a1/a0, a2/a0])
+        return b, a
+
+    def _setup_tone_filters(self):
+        """Set up bass and treble shelf filters (+3dB)."""
+        fs = self.audio_sample_rate
+        self.bass_b, self.bass_a = self._design_low_shelf(250, 3.0, fs)
+        self.bass_state_l = signal.lfilter_zi(self.bass_b, self.bass_a)
+        self.treble_b, self.treble_a = self._design_high_shelf(3500, 3.0, fs)
+        self.treble_state_l = signal.lfilter_zi(self.treble_b, self.treble_a)
+
+    @property
+    def snr_db(self):
+        """Return the current SNR estimate in dB."""
+        return self._snr_db
+
+    @property
+    def peak_amplitude(self):
+        """Return peak amplitude (before limiting)."""
+        return self._peak_amplitude
+
+    @property
+    def pilot_detected(self):
+        """Always False for NBFM (no stereo pilot)."""
+        return False
+
+    @property
+    def stereo_blend_factor(self):
+        """Always 0 for NBFM (mono only)."""
+        return 0.0
+
+    @property
+    def last_baseband(self):
+        """Returns None - NBFM doesn't provide baseband for RDS."""
+        return None
+
+    def demodulate(self, iq_samples):
+        """
+        Demodulate NBFM signal from IQ samples.
+
+        Args:
+            iq_samples: numpy array of complex64 IQ samples
+
+        Returns:
+            numpy array of shape (N, 2) with mono audio duplicated to L/R
+        """
+        if len(iq_samples) == 0:
+            return np.zeros((0, 2), dtype=np.float32)
+
+        # FM demodulation (quadrature discriminator)
+        samples = np.concatenate([[self.last_sample], iq_samples])
+        self.last_sample = iq_samples[-1]
+
+        product = samples[1:] * np.conj(samples[:-1])
+        baseband = np.angle(product) * (self.iq_sample_rate / (2 * np.pi * self.deviation))
+
+        # Audio lowpass filter (3 kHz)
+        audio, self.audio_lpf_state = signal.lfilter(
+            self.audio_lpf, 1.0, baseband, zi=self.audio_lpf_state
+        )
+
+        # SNR measurement
+        # Measure signal power from the filtered audio
+        signal_power = np.mean(audio ** 2)
+
+        # Measure noise power in a band outside the FM signal spectrum
+        if self.noise_bpf is not None:
+            noise_filtered, self.noise_bpf_state = signal.lfilter(
+                self.noise_bpf, 1.0, baseband, zi=self.noise_bpf_state
+            )
+            noise_power = np.mean(noise_filtered ** 2)
+            # Scale noise from measurement bandwidth to audio bandwidth
+            noise_power_scaled = noise_power * (self.audio_bandwidth / self.noise_bandwidth)
+
+            # Smooth the measurements
+            self._signal_power = 0.9 * self._signal_power + 0.1 * signal_power
+            self._noise_power = 0.9 * self._noise_power + 0.1 * max(noise_power_scaled, 1e-12)
+
+            if self._noise_power > 0:
+                self._snr_db = 10 * np.log10(self._signal_power / self._noise_power)
+
+        # Resample to audio rate
+        audio = signal.resample_poly(audio, self.resample_up, self.resample_down)
+
+        # Apply tone controls
+        if self.bass_boost_enabled:
+            audio, self.bass_state_l = signal.lfilter(
+                self.bass_b, self.bass_a, audio, zi=self.bass_state_l
+            )
+        if self.treble_boost_enabled:
+            audio, self.treble_state_l = signal.lfilter(
+                self.treble_b, self.treble_a, audio, zi=self.treble_state_l
+            )
+
+        # Track peak amplitude
+        peak = np.max(np.abs(audio))
+        self._peak_amplitude = max(0.95 * self._peak_amplitude, peak)
+
+        # Apply soft limiting
+        audio = audio * 0.7
+        tanh_scale = np.tanh(1.5)
+        audio = np.tanh(audio * 1.5) / tanh_scale
+        audio = np.clip(audio, -1.0, 1.0).astype(np.float32)
+
+        # Duplicate mono to stereo
+        return np.column_stack((audio, audio))
+
+    def reset(self):
+        """Reset decoder state (call when changing frequency)."""
+        self.last_sample = complex(1, 0)
+        self._snr_db = 0.0
+        self._signal_power = 0.0
+        self._noise_power = 1e-10
+        self._peak_amplitude = 0.0
+
+        # Reset filter states
+        self.audio_lpf_state = signal.lfilter_zi(self.audio_lpf, 1.0)
+        if self.noise_bpf is not None:
+            self.noise_bpf_state = signal.lfilter_zi(self.noise_bpf, 1.0)
+        self.bass_state_l = signal.lfilter_zi(self.bass_b, self.bass_a)
+        self.treble_state_l = signal.lfilter_zi(self.treble_b, self.treble_a)
+
+
 if __name__ == "__main__":
     # Test with synthetic FM signal
     import matplotlib
