@@ -25,6 +25,7 @@ Controls:
     b: Toggle bass boost
     t: Toggle treble boost
     a: Toggle spectrum analyzer
+    G: Toggle GPU demodulator (FM mode only)
     Q: Toggle squelch
     q: Quit
 """
@@ -64,6 +65,7 @@ except ImportError as e:
     sys.exit(1)
 
 from demodulator import FMStereoDecoder, NBFMDecoder
+from gpu import GPUFMDemodulator, GPUResampler
 from rds_decoder import RDSDecoder, pi_to_callsign
 
 
@@ -536,6 +538,11 @@ class FMRadio:
         self._initial_bass_boost = True
         self._initial_treble_boost = True
 
+        # GPU demodulator and resampler (off by default)
+        self.gpu_demod = None
+        self.gpu_resampler = None
+        self.gpu_enabled = True
+
         # Weather radio mode (NBFM for NWS)
         self.weather_mode = False
         self.nbfm_decoder = None
@@ -606,6 +613,15 @@ class FMRadio:
         try:
             self.device.open()
 
+            # Create GPU FM demodulator before IQ streaming starts.
+            # PyTorch/ROCm init (HIP runtime, device query) is heavyweight
+            # and can take hundreds of ms. Doing it before configure_iq_streaming
+            # prevents BB60D internal buffer overflow from the init delay.
+            self.gpu_demod = GPUFMDemodulator(
+                sample_rate=self.IQ_SAMPLE_RATE,
+                deviation=75000
+            )
+
             # Configure IQ streaming
             self.device.configure_iq_streaming(self.device.frequency, self.IQ_SAMPLE_RATE)
 
@@ -629,6 +645,27 @@ class FMRadio:
                 deviation=5000  # 5 kHz deviation for NBFM
             )
 
+            # Update GPU demod sample rate if device returned a different rate
+            if actual_rate != self.IQ_SAMPLE_RATE:
+                self.gpu_demod = GPUFMDemodulator(
+                    sample_rate=actual_rate,
+                    deviation=75000
+                )
+
+            # Create GPU resampler (uses same backend as demodulator)
+            self.gpu_resampler = GPUResampler(
+                up=self.stereo_decoder.resample_up,
+                down=self.stereo_decoder.resample_down,
+                n_input=self.IQ_BLOCK_SIZE
+            )
+
+            # Attach GPU components to stereo decoder (GPU enabled by default)
+            if self.gpu_enabled:
+                if self.gpu_demod:
+                    self.stereo_decoder.gpu_demodulator = self.gpu_demod
+                if self.gpu_resampler:
+                    self.stereo_decoder.gpu_resampler = self.gpu_resampler
+
             self.audio_player.start()
             self.running = True
 
@@ -645,6 +682,18 @@ class FMRadio:
         self.running = False
         if self.audio_thread:
             self.audio_thread.join(timeout=1.0)
+        # Detach GPU components from stereo decoder before cleanup
+        if self.stereo_decoder:
+            self.stereo_decoder.gpu_demodulator = None
+            self.stereo_decoder.gpu_resampler = None
+        # Release GPU/HIP resources while the runtime is still valid,
+        # before Python shutdown triggers GC vs HIP teardown race
+        if self.gpu_resampler:
+            self.gpu_resampler.cleanup()
+            self.gpu_resampler = None
+        if self.gpu_demod:
+            self.gpu_demod.cleanup()
+            self.gpu_demod = None
         self.audio_player.stop()
         self.device.close()
 
@@ -899,6 +948,11 @@ class FMRadio:
         """Toggle automatic RDS mode based on 19 kHz pilot detection."""
         self.auto_mode_enabled = not self.auto_mode_enabled
 
+    def toggle_profile(self):
+        """Toggle demodulator profiling on/off."""
+        if self.stereo_decoder:
+            self.stereo_decoder.profile_enabled = not self.stereo_decoder.profile_enabled
+
     def toggle_bass_boost(self):
         """Toggle bass boost on/off."""
         if self.weather_mode and self.nbfm_decoder:
@@ -931,6 +985,27 @@ class FMRadio:
                 # Enable
                 self.rds_decoder.enable_diagnostics(True)
                 return "enabled"
+        return None
+
+    def toggle_gpu_demod(self):
+        """Toggle GPU demodulator and resampler on/off (FM mode only)."""
+        self.gpu_enabled = not self.gpu_enabled
+        if self.stereo_decoder:
+            if self.gpu_enabled:
+                if self.gpu_demod:
+                    self.stereo_decoder.gpu_demodulator = self.gpu_demod
+                    self.gpu_demod.reset()
+                if self.gpu_resampler:
+                    self.stereo_decoder.gpu_resampler = self.gpu_resampler
+            else:
+                self.stereo_decoder.gpu_demodulator = None
+                self.stereo_decoder.gpu_resampler = None
+
+    @property
+    def gpu_backend(self):
+        """Return the GPU demodulator backend name, or None."""
+        if self.gpu_demod:
+            return self.gpu_demod.backend
         return None
 
     def toggle_weather_mode(self):
@@ -1312,6 +1387,17 @@ def build_display(radio, width=80):
         tone_text.append("Treble OFF", style="dim")
     table.add_row("Boost:", tone_text)
 
+    # Demodulator status (FM mode only)
+    if not radio.weather_mode:
+        demod_text = Text()
+        if radio.gpu_enabled:
+            backend = radio.gpu_backend or "unknown"
+            demod_text.append(f"GPU ({backend})", style="green bold")
+            demod_text.append(" — demod + resample", style="green")
+        else:
+            demod_text.append("CPU (quadrature)", style="dim")
+        table.add_row("Demod:", demod_text)
+
     # RDS status (FM mode only)
     if not radio.weather_mode:
         rds_text = Text()
@@ -1435,6 +1521,66 @@ def build_display(radio, width=80):
             loss_text.append("0", style="green bold")
         table.add_row("IQ Loss:", loss_text)
 
+        # Demodulator stage profiling
+        if not radio.weather_mode and radio.stereo_decoder and radio.stereo_decoder.profile_enabled:
+            prof = radio.stereo_decoder.profile
+            table.add_row("", "")
+            prof_header = Text()
+            prof_header.append("Demod Profile (µs/block, EMA)", style="yellow bold")
+            table.add_row("Profile:", prof_header)
+
+            # Sorted by cost descending for easy identification of hot spots
+            stages = [
+                ('fm_demod', 'FM Demod'),
+                ('pilot_bpf', 'Pilot BPF'),
+                ('pll', 'PLL'),
+                ('lr_sum_lpf', 'L+R LPF'),
+                ('lr_diff_bpf', 'L-R BPF'),
+                ('lr_diff_lpf', 'L-R LPF'),
+                ('noise_bpf', 'Noise BPF'),
+                ('resample', 'Resample'),
+                ('deemphasis', 'De-emph'),
+                ('tone', 'Tone'),
+                ('limiter', 'Limiter'),
+            ]
+            total_us = prof.get('total', 1.0)
+
+            # Sort by time descending
+            stage_times = [(key, label, prof.get(key, 0.0)) for key, label in stages]
+            stage_times.sort(key=lambda x: x[2], reverse=True)
+
+            for key, label, us in stage_times:
+                pct = (us / total_us * 100) if total_us > 0 else 0
+                stage_text = Text()
+                # Bar proportional to percentage (max 20 chars)
+                bar_len = int(pct / 5)  # 20 chars = 100%
+                if pct > 30:
+                    bar_style = "red bold"
+                elif pct > 15:
+                    bar_style = "yellow"
+                else:
+                    bar_style = "green"
+                stage_text.append(f"{label:<12}", style="cyan")
+                stage_text.append(f"{us:7.0f}", style=bar_style)
+                stage_text.append(f" ({pct:4.1f}%) ", style="dim")
+                stage_text.append("█" * bar_len, style=bar_style)
+                table.add_row("", stage_text)
+
+            # Total
+            total_text = Text()
+            total_text.append(f"{'Total':<12}", style="cyan bold")
+            total_text.append(f"{total_us:7.0f}", style="bright_white bold")
+            budget_us = 8192 / 312500 * 1e6  # ~26214 µs at 312.5 kHz
+            budget_pct = total_us / budget_us * 100
+            if budget_pct > 80:
+                budget_style = "red bold"
+            elif budget_pct > 50:
+                budget_style = "yellow"
+            else:
+                budget_style = "green"
+            total_text.append(f" ({budget_pct:.0f}% of {budget_us/1000:.1f}ms budget)", style=budget_style)
+            table.add_row("", total_text)
+
     # Controls section
     controls = Text()
     controls.append("\n")
@@ -1455,6 +1601,9 @@ def build_display(radio, width=80):
     controls.append("Spect  ", style="dim")
     controls.append("Q ", style="cyan bold")
     controls.append("Squelch  ", style="dim")
+    if not radio.weather_mode:
+        controls.append("G ", style="cyan bold")
+        controls.append("GPU  ", style="dim")
     controls.append("q ", style="cyan bold")
     controls.append("Quit", style="dim")
 
@@ -1643,6 +1792,15 @@ def run_rich_ui(radio):
                         # Toggle buffer stats (hidden debug feature)
                         radio.toggle_buffer_stats()
                         input_buffer = input_buffer[1:]
+                    elif input_buffer[0] == 'P':
+                        # Toggle demod profiling (hidden debug feature)
+                        radio.toggle_profile()
+                        input_buffer = input_buffer[1:]
+                    elif input_buffer[0] == 'G':
+                        # Toggle GPU demodulator (FM mode only)
+                        if not radio.weather_mode:
+                            radio.toggle_gpu_demod()
+                        input_buffer = input_buffer[1:]
                     elif input_buffer[0] in ('d', 'D'):
                         # Toggle RDS diagnostics (d=start, D=dump to /tmp/rds_timing_diag.txt)
                         result = radio.toggle_rds_diagnostics()
@@ -1745,6 +1903,12 @@ def main():
         sys.exit(1)
 
     print(f"\n📻 Goodbye! Last frequency: {radio.frequency_mhz:.1f} MHz")
+
+    # Hard exit to prevent ROCm/HIP double-free during Python shutdown.
+    # Python's atexit handlers and GC race with the HIP runtime teardown,
+    # causing "double free or corruption (!prev)" on process exit.
+    # All resources are already cleaned up by radio.stop().
+    os._exit(0)
 
 
 if __name__ == "__main__":
