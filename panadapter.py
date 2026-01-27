@@ -94,6 +94,15 @@ class NBFMDemodulator:
         self.deemph_alpha = 1.0  # Bypass if not used
         self.deemph_state = 0.0
 
+        # High-pass filter for hum reduction (removes low-frequency noise)
+        # Cutoff at 150 Hz - removes 60 Hz hum and harmonics while preserving voice
+        self.hum_filter_enabled = False
+        hum_cutoff = 150 / (self.actual_if_rate / 2)
+        self.hum_filter_b, self.hum_filter_a = signal.butter(
+            2, hum_cutoff, btype='high'
+        )
+        self.hum_filter_state = None
+
         # Resampler for audio output
         self.resample_ratio = audio_sample_rate / self.actual_if_rate
 
@@ -110,6 +119,12 @@ class NBFMDemodulator:
     def set_squelch(self, level_db):
         """Set squelch threshold in dB."""
         self.squelch_level = level_db
+
+    def set_hum_filter(self, enabled):
+        """Enable or disable the hum reduction filter."""
+        self.hum_filter_enabled = enabled
+        if not enabled:
+            self.hum_filter_state = None
 
     def process(self, iq_data):
         """
@@ -190,6 +205,18 @@ class NBFMDemodulator:
             deemph_audio, zi=self.audio_filter_state
         )
 
+        # Apply hum reduction high-pass filter if enabled
+        if self.hum_filter_enabled:
+            if self.hum_filter_state is None:
+                self.hum_filter_state = signal.lfilter_zi(
+                    self.hum_filter_b, self.hum_filter_a
+                ) * audio_filtered[0]
+
+            audio_filtered, self.hum_filter_state = signal.lfilter(
+                self.hum_filter_b, self.hum_filter_a,
+                audio_filtered, zi=self.hum_filter_state
+            )
+
         # Resample to output audio rate
         num_output_samples = int(len(audio_filtered) * self.resample_ratio)
         if num_output_samples > 0:
@@ -204,6 +231,7 @@ class NBFMDemodulator:
         """Reset demodulator state (call when changing frequency)."""
         self.channel_filter_state = None
         self.audio_filter_state = None
+        self.hum_filter_state = None
         self.prev_sample = 1 + 0j
         self.deemph_state = 0.0
         self.audio_buffer.clear()
@@ -1244,6 +1272,15 @@ class MainWindow(QMainWindow):
 
         demod_layout.addStretch()
 
+        # Hum filter checkbox (for Weather mode - reduces NWS low-frequency hum)
+        self.hum_filter_checkbox = QCheckBox('Hum Filter')
+        self.hum_filter_checkbox.setChecked(False)
+        self.hum_filter_checkbox.setToolTip('High-pass filter to reduce low-frequency hum (150 Hz cutoff)')
+        self.hum_filter_checkbox.stateChanged.connect(self.on_hum_filter_toggle)
+        demod_layout.addWidget(self.hum_filter_checkbox)
+
+        demod_layout.addStretch()
+
         # Stereo indicator (for FM Broadcast mode)
         self.stereo_label = QLabel('Stereo:')
         demod_layout.addWidget(self.stereo_label)
@@ -1582,17 +1619,19 @@ class MainWindow(QMainWindow):
         if new_mode == self.MODE_FM_BROADCAST:
             new_freq = FM_BROADCAST_DEFAULT
             new_sample_rate = FM_BROADCAST_SAMPLE_RATE
-            # Hide NOAA presets
+            # Hide NOAA presets and hum filter (not applicable to FM broadcast)
             self.noaa_label.hide()
             for btn in self.noaa_buttons:
                 btn.hide()
+            self.hum_filter_checkbox.hide()
         else:
             new_freq = DEFAULT_CENTER_FREQ
             new_sample_rate = SAMPLE_RATE
-            # Show NOAA presets
+            # Show NOAA presets and hum filter
             self.noaa_label.show()
             for btn in self.noaa_buttons:
                 btn.show()
+            self.hum_filter_checkbox.show()
 
         # Reconfigure device with new sample rate and frequency
         if self.device and self.device.streaming_mode:
@@ -1674,6 +1713,12 @@ class MainWindow(QMainWindow):
             self.nbfm_demodulator.set_squelch(value)
         if self.wbfm_demodulator:
             self.wbfm_demodulator.set_squelch(value)
+
+    def on_hum_filter_toggle(self, state):
+        """Handle hum filter checkbox change."""
+        enabled = state == Qt.Checked
+        if self.nbfm_demodulator:
+            self.nbfm_demodulator.set_hum_filter(enabled)
 
     def on_volume_changed(self, value):
         """Handle volume slider change."""
