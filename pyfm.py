@@ -635,7 +635,8 @@ class FMRadio:
 
         # Radio section
         config['radio'] = {
-            'last_frequency': f'{self.device.frequency / 1e6:.1f}'
+            'last_frequency': f'{self.device.frequency / 1e6:.1f}',
+            'device': 'icom' if self.use_icom else 'bb60d'
         }
 
         # Presets section
@@ -1961,7 +1962,12 @@ def main():
     parser.add_argument(
         "--icom",
         action="store_true",
-        help="Use Icom IC-R8600 as I/Q source instead of BB60D"
+        help="Use Icom IC-R8600 as I/Q source"
+    )
+    parser.add_argument(
+        "--bb60d",
+        action="store_true",
+        help="Use SignalHound BB60D as I/Q source"
     )
     parser.add_argument(
         "--version",
@@ -1970,6 +1976,11 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Handle conflicting device flags
+    if args.icom and args.bb60d:
+        print("Error: Cannot specify both --icom and --bb60d")
+        sys.exit(1)
 
     if args.version:
         print("pyfm - FM Radio Receiver")
@@ -1989,30 +2000,38 @@ def main():
             print("IC-R8600: not available")
         return
 
-    # Determine initial frequency
+    # Load config for defaults
+    initial_freq = 89.9e6  # Default frequency
+    use_icom = False  # Default device
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pyfm.cfg')
+    if os.path.exists(config_path):
+        config = configparser.ConfigParser()
+        try:
+            config.read(config_path)
+            if config.has_option('radio', 'last_frequency'):
+                freq_mhz = config.getfloat('radio', 'last_frequency')
+                if 88.0 <= freq_mhz <= 108.0:
+                    initial_freq = freq_mhz * 1e6
+            if config.has_option('radio', 'device'):
+                device = config.get('radio', 'device').strip().lower()
+                use_icom = (device == 'icom')
+        except (ValueError, configparser.Error):
+            pass
+
+    # Command-line arguments override config
     if args.frequency is not None:
-        # User provided frequency on command line
         if not (88.0 <= args.frequency <= 108.0):
             print("Error: Frequency must be between 88.0 and 108.0 MHz")
             sys.exit(1)
         initial_freq = args.frequency * 1e6
-    else:
-        # Try to load from config file
-        initial_freq = 89.9e6  # Default
-        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pyfm.cfg')
-        if os.path.exists(config_path):
-            config = configparser.ConfigParser()
-            try:
-                config.read(config_path)
-                if config.has_option('radio', 'last_frequency'):
-                    freq_mhz = config.getfloat('radio', 'last_frequency')
-                    if 88.0 <= freq_mhz <= 108.0:
-                        initial_freq = freq_mhz * 1e6
-            except (ValueError, configparser.Error):
-                pass
+
+    if args.icom:
+        use_icom = True
+    elif args.bb60d:
+        use_icom = False
 
     # Create radio instance
-    radio = FMRadio(initial_freq=initial_freq, use_icom=args.icom)
+    radio = FMRadio(initial_freq=initial_freq, use_icom=use_icom)
 
     # Run rich UI
     try:
@@ -2023,7 +2042,7 @@ def main():
         print(f"Error: {e}")
         sys.exit(1)
 
-    device_name = "IC-R8600" if args.icom else "BB60D"
+    device_name = "IC-R8600" if use_icom else "BB60D"
     print(f"\n📻 Goodbye! Last frequency: {radio.frequency_mhz:.1f} MHz ({device_name})")
 
     # Hard exit to prevent ROCm/HIP double-free during Python shutdown.
