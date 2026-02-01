@@ -815,16 +815,6 @@ class FMRadio:
 
     def _audio_loop(self):
         """Background thread for IQ capture, demodulation, and signal measurement."""
-        # Performance tracking
-        self._perf_stats = {
-            'fetch_time': 0.0,
-            'stereo_time': 0.0,
-            'rds_time': 0.0,
-            'total_time': 0.0,
-            'sample_loss': 0,
-            'iterations': 0,
-        }
-
         # Startup stabilization: discard blocks until buffer level is reasonable
         startup_blocks = 0
         max_startup_blocks = 50  # ~1 second worth
@@ -839,13 +829,9 @@ class FMRadio:
                     time.sleep(0.01)
                     continue
 
-                t_start = time.perf_counter()
-
                 with self.tuning_lock:
                     # Get IQ samples
-                    t_fetch_start = time.perf_counter()
                     iq = self.device.fetch_iq(self.IQ_BLOCK_SIZE)
-                    t_fetch_end = time.perf_counter()
 
                 # Check again after fetch - if tuning started mid-fetch, discard samples
                 if self.is_tuning:
@@ -901,14 +887,12 @@ class FMRadio:
                     self._rate_log_file.flush()
 
                 # Demodulate FM using appropriate decoder
-                t_demod_start = time.perf_counter()
                 if self.weather_mode:
                     # NBFM for weather radio
                     audio = self.nbfm_decoder.demodulate(iq)
                 else:
                     # Wideband FM stereo for broadcast
                     audio = self.stereo_decoder.demodulate(iq)
-                t_demod_end = time.perf_counter()
 
                 # Auto mode: RDS is enabled when pilot is present (FM broadcast only)
                 # (pilot = station has stereo/RDS capability)
@@ -925,13 +909,10 @@ class FMRadio:
 
                 # Process RDS inline (no queue) for sample continuity (FM broadcast only)
                 if not self.weather_mode and self.rds_enabled and self.rds_decoder and self.stereo_decoder.last_baseband is not None:
-                    t_rds_start = time.perf_counter()
                     self.rds_data = self.rds_decoder.process(
                         self.stereo_decoder.last_baseband,
                         use_coherent=True  # Use pilot-derived carrier
                     )
-                    t_rds_end = time.perf_counter()
-                    self._perf_stats['rds_time'] = 0.9 * self._perf_stats.get('rds_time', 0) + 0.1 * (t_rds_end - t_rds_start) * 1000
 
                 # Apply squelch (mute if signal below threshold)
                 if squelched:
@@ -952,13 +933,6 @@ class FMRadio:
                 # Queue audio for playback
                 self.audio_player.queue_audio(audio)
 
-                # Update performance stats
-                t_end = time.perf_counter()
-                self._perf_stats['fetch_time'] = 0.9 * self._perf_stats['fetch_time'] + 0.1 * (t_fetch_end - t_fetch_start) * 1000
-                self._perf_stats['demod_time'] = 0.9 * self._perf_stats.get('demod_time', 0) + 0.1 * (t_demod_end - t_demod_start) * 1000
-                self._perf_stats['total_time'] = 0.9 * self._perf_stats['total_time'] + 0.1 * (t_end - t_start) * 1000
-                self._perf_stats['iterations'] += 1
-
             except Exception as e:
                 # Ignore errors during tuning
                 if not self.is_tuning:
@@ -968,13 +942,6 @@ class FMRadio:
     def get_signal_strength(self):
         """Get last measured signal strength in dBm."""
         return self.signal_dbm  # No lock needed for single float read
-
-    @property
-    def perf_stats(self):
-        """Get performance statistics."""
-        if hasattr(self, '_perf_stats'):
-            return self._perf_stats
-        return None
 
     def tune_up(self):
         """Tune up by 100 kHz (FM) or 25 kHz (Weather)."""
