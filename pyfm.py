@@ -25,7 +25,6 @@ Controls:
     b: Toggle bass boost
     t: Toggle treble boost
     a: Toggle spectrum analyzer
-    G: Toggle GPU demodulator (FM mode only)
     Q: Toggle squelch
     d: Toggle RDS diagnostics (press twice to dump to /tmp/rds_diag.txt)
     B: Toggle debug stats display
@@ -71,7 +70,6 @@ except ImportError as e:
     r8600_get_api_version = None
 
 from demodulator import FMStereoDecoder, NBFMDecoder
-from gpu import GPUFMDemodulator, GPUFIRBank, GPUFIRFilter
 from rds_decoder import RDSDecoder, pi_to_callsign
 
 
@@ -555,8 +553,7 @@ class FMRadio:
     # Config file path (in same directory as script)
     CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pyfm.cfg')
 
-    def __init__(self, initial_freq=89.9e6, use_icom=False, use_24bit=False, preamp=None,
-                 gpu_enabled=True):
+    def __init__(self, initial_freq=89.9e6, use_icom=False, use_24bit=False, preamp=None):
         """
         Initialize FM Radio.
 
@@ -565,7 +562,6 @@ class FMRadio:
             use_icom: If True, use IC-R8600 instead of BB60D
             use_24bit: If True, use 24-bit I/Q samples (IC-R8600 only)
             preamp: None (don't touch), True (force on), or False (force off)
-            gpu_enabled: If True, use GPU acceleration for FM demodulation
         """
         self.use_icom = use_icom
         self.use_24bit = use_24bit
@@ -630,13 +626,6 @@ class FMRadio:
         self._initial_bass_boost = True
         self._initial_treble_boost = True
 
-        # GPU demodulator, resampler, and FIR filters
-        self.gpu_demod = None
-        self.gpu_resampler = None
-        self.gpu_fir_bank = None
-        self.gpu_fir_lr_diff = None
-        self.gpu_enabled = gpu_enabled
-
         # Weather radio mode (NBFM for NWS)
         self.weather_mode = False
         self.nbfm_decoder = None
@@ -680,8 +669,7 @@ class FMRadio:
         config['radio'] = {
             'last_frequency': f'{self.device.frequency / 1e6:.1f}',
             'device': 'icom' if self.use_icom else 'bb60d',
-            'use_24bit': str(self.use_24bit).lower(),
-            'gpu': str(self.gpu_enabled).lower()
+            'use_24bit': str(self.use_24bit).lower()
         }
 
         # Presets section
@@ -710,9 +698,7 @@ class FMRadio:
         try:
             self.device.open()
 
-            # Configure IQ streaming first to learn the actual sample rate.
-            # This is fast (~2 ms) and the BB60D starts buffering, but
-            # we flush stale data before entering the audio loop.
+            # Start IQ streaming to get actual sample rate
             self.device.configure_iq_streaming(self.device.frequency, self.IQ_SAMPLE_RATE)
             actual_rate = self.device.iq_sample_rate
 
@@ -720,15 +706,7 @@ class FMRadio:
             if self._preamp_setting is not None and hasattr(self.device, 'set_preamp'):
                 self.device.set_preamp(self._preamp_setting)
 
-            # Create all decoders and GPU objects with the correct rate.
-            # PyTorch/ROCm init and scipy filter design are heavyweight
-            # (~2-3 s total). The BB60D buffers during this time; we flush
-            # stale IQ data before the audio loop starts.
-            self.gpu_demod = GPUFMDemodulator(
-                sample_rate=actual_rate,
-                deviation=75000
-            )
-
+            # Create decoders
             self.stereo_decoder = FMStereoDecoder(
                 iq_sample_rate=actual_rate,
                 audio_sample_rate=self.AUDIO_SAMPLE_RATE,
@@ -745,42 +723,6 @@ class FMRadio:
                 audio_sample_rate=self.AUDIO_SAMPLE_RATE,
                 deviation=5000
             )
-
-            self.gpu_fir_bank = GPUFIRBank(
-                [self.stereo_decoder.pilot_bpf,
-                 self.stereo_decoder.lr_sum_lpf,
-                 self.stereo_decoder.lr_diff_bpf],
-                block_size=self.IQ_BLOCK_SIZE
-            )
-
-            self.gpu_fir_lr_diff = GPUFIRFilter(
-                self.stereo_decoder.lr_diff_lpf,
-                block_size=self.IQ_BLOCK_SIZE
-            )
-
-            # GPU resampler disabled - using adaptive CPU resampling for rate control
-            # self.gpu_resampler = GPUResampler(
-            #     up=self.stereo_decoder.resample_up,
-            #     down=self.stereo_decoder.resample_down,
-            #     n_input=self.IQ_BLOCK_SIZE
-            # )
-            self.gpu_resampler = None
-
-            # Flush stale IQ data that accumulated during init.
-            # The audio loop has startup stabilization that discards blocks
-            # if the buffer fills too fast, so a simple flush here is sufficient.
-            self.device.flush_iq()
-
-            # Attach GPU components to stereo decoder (GPU enabled by default)
-            if self.gpu_enabled:
-                if self.gpu_demod:
-                    self.stereo_decoder.gpu_demodulator = self.gpu_demod
-                if self.gpu_resampler:
-                    self.stereo_decoder.gpu_resampler = self.gpu_resampler
-                if self.gpu_fir_bank:
-                    self.stereo_decoder.gpu_fir_bank = self.gpu_fir_bank
-                if self.gpu_fir_lr_diff:
-                    self.stereo_decoder.gpu_fir_lr_diff = self.gpu_fir_lr_diff
 
             self.audio_player.start()
             self.running = True
@@ -802,36 +744,11 @@ class FMRadio:
         if hasattr(self, '_rate_log_file') and self._rate_log_file:
             self._rate_log_file.close()
             self._rate_log_file = None
-        # Detach GPU components from stereo decoder before cleanup
-        if self.stereo_decoder:
-            self.stereo_decoder.gpu_demodulator = None
-            self.stereo_decoder.gpu_resampler = None
-            self.stereo_decoder.gpu_fir_bank = None
-            self.stereo_decoder.gpu_fir_lr_diff = None
-        # Release GPU/HIP resources while the runtime is still valid,
-        # before Python shutdown triggers GC vs HIP teardown race
-        if self.gpu_fir_bank:
-            self.gpu_fir_bank.cleanup()
-            self.gpu_fir_bank = None
-        if self.gpu_fir_lr_diff:
-            self.gpu_fir_lr_diff.cleanup()
-            self.gpu_fir_lr_diff = None
-        if self.gpu_resampler:
-            self.gpu_resampler.cleanup()
-            self.gpu_resampler = None
-        if self.gpu_demod:
-            self.gpu_demod.cleanup()
-            self.gpu_demod = None
         self.audio_player.stop()
         self.device.close()
 
     def _audio_loop(self):
         """Background thread for IQ capture, demodulation, and signal measurement."""
-        # Startup stabilization: process and discard blocks to drain IQ backlog
-        # We process at full speed but don't output audio until buffer stabilizes
-        startup_blocks = 0
-        max_startup_blocks = 100  # ~2 seconds to drain USB/OS backlog
-
         # PI rate control state
         # Kp: proportional gain (50 ppm per ms error - fast response)
         # Ki: integral gain (slow drift correction, 5x reduction to reduce oscillation)
@@ -888,22 +805,15 @@ class FMRadio:
                 buf_target = self.audio_player._target_level_ms
                 buf_error = buf_level - buf_target  # positive = buffer too full
 
-                # During startup, freeze PI controller to avoid integrator windup
-                # from processing the initial IQ backlog
-                if startup_blocks < max_startup_blocks:
-                    p_term = 0.0
-                    i_term = 0.0
-                    rate_adj = 1.0  # Unity rate during startup
-                else:
-                    # PI controller (only after startup stabilization)
-                    p_term = buf_error * self._rate_Kp
-                    self._rate_integrator += buf_error * self._rate_Ki
-                    # Anti-windup: clamp integrator to prevent runaway
-                    self._rate_integrator = max(-self._rate_integrator_max,
-                                                min(self._rate_integrator_max, self._rate_integrator))
-                    i_term = self._rate_integrator
-                    rate_adj = 1.0 - (p_term + i_term)
-                    rate_adj = max(0.99, min(1.01, rate_adj))  # clamp to ±1%
+                # PI controller for adaptive rate control
+                p_term = buf_error * self._rate_Kp
+                self._rate_integrator += buf_error * self._rate_Ki
+                # Anti-windup: clamp integrator to prevent runaway
+                self._rate_integrator = max(-self._rate_integrator_max,
+                                            min(self._rate_integrator_max, self._rate_integrator))
+                i_term = self._rate_integrator
+                rate_adj = 1.0 - (p_term + i_term)
+                rate_adj = max(0.99, min(1.01, rate_adj))  # clamp to ±1%
 
                 if self.weather_mode:
                     self.nbfm_decoder.rate_adjust = rate_adj
@@ -960,14 +870,6 @@ class FMRadio:
                 # Update spectrum analyzer
                 if self.spectrum_enabled:
                     self.spectrum_analyzer.update(audio)
-
-                # Startup stabilization: let the stream settle after initial flush
-                if startup_blocks < max_startup_blocks:
-                    startup_blocks += 1
-                    # Reset audio buffer on last startup block for clean start
-                    if startup_blocks == max_startup_blocks:
-                        self.audio_player.reset()
-                    continue  # Discard this block
 
                 # Queue audio for playback
                 self.audio_player.queue_audio(audio)
@@ -1153,46 +1055,6 @@ class FMRadio:
                 # Enable
                 self.rds_decoder.enable_diagnostics(True)
                 return "enabled"
-        return None
-
-    def toggle_gpu_demod(self):
-        """Toggle GPU demodulator, resampler, and FIR filters on/off (FM mode only)."""
-        self.gpu_enabled = not self.gpu_enabled
-        if self.stereo_decoder:
-            if self.gpu_enabled:
-                if self.gpu_demod:
-                    self.stereo_decoder.gpu_demodulator = self.gpu_demod
-                    self.gpu_demod.reset()
-                if self.gpu_resampler:
-                    self.stereo_decoder.gpu_resampler = self.gpu_resampler
-                if self.gpu_fir_bank:
-                    self.stereo_decoder.gpu_fir_bank = self.gpu_fir_bank
-                    self.gpu_fir_bank.reset()
-                if self.gpu_fir_lr_diff:
-                    self.stereo_decoder.gpu_fir_lr_diff = self.gpu_fir_lr_diff
-                    self.gpu_fir_lr_diff.reset()
-            else:
-                self.stereo_decoder.gpu_demodulator = None
-                self.stereo_decoder.gpu_resampler = None
-                self.stereo_decoder.gpu_fir_bank = None
-                self.stereo_decoder.gpu_fir_lr_diff = None
-                # Reset CPU filter states to avoid stale state from GPU bypass
-                from scipy import signal as sig
-                self.stereo_decoder.pilot_bpf_state = sig.lfilter_zi(
-                    self.stereo_decoder.pilot_bpf, 1.0)
-                self.stereo_decoder.lr_sum_lpf_state = sig.lfilter_zi(
-                    self.stereo_decoder.lr_sum_lpf, 1.0)
-                self.stereo_decoder.lr_diff_bpf_state = sig.lfilter_zi(
-                    self.stereo_decoder.lr_diff_bpf, 1.0)
-                self.stereo_decoder.lr_diff_lpf_state = sig.lfilter_zi(
-                    self.stereo_decoder.lr_diff_lpf, 1.0)
-        self._save_config()
-
-    @property
-    def gpu_backend(self):
-        """Return the GPU demodulator backend name, or None."""
-        if self.gpu_demod:
-            return self.gpu_demod.backend
         return None
 
     def toggle_weather_mode(self):
@@ -1577,17 +1439,6 @@ def build_display(radio, width=80):
         tone_text.append("Treble OFF", style="dim")
     table.add_row("Boost:", tone_text)
 
-    # Demodulator status (FM mode only)
-    if not radio.weather_mode:
-        demod_text = Text()
-        if radio.gpu_enabled:
-            backend = radio.gpu_backend or "unknown"
-            demod_text.append(f"GPU ({backend})", style="green bold")
-            demod_text.append(" — demod + FIR", style="green")
-        else:
-            demod_text.append("CPU (quadrature)", style="dim")
-        table.add_row("Demod:", demod_text)
-
     # RDS status (FM mode only)
     if not radio.weather_mode:
         rds_text = Text()
@@ -1829,9 +1680,6 @@ def build_display(radio, width=80):
     controls.append("Spect  ", style="dim")
     controls.append("Q ", style="cyan bold")
     controls.append("Squelch  ", style="dim")
-    if not radio.weather_mode:
-        controls.append("G ", style="cyan bold")
-        controls.append("GPU  ", style="dim")
     controls.append("q ", style="cyan bold")
     controls.append("Quit", style="dim")
 
@@ -2025,11 +1873,6 @@ def run_rich_ui(radio):
                         # Toggle demod profiling (hidden debug feature)
                         radio.toggle_profile()
                         input_buffer = input_buffer[1:]
-                    elif input_buffer[0] == 'G':
-                        # Toggle GPU demodulator (FM mode only)
-                        if not radio.weather_mode:
-                            radio.toggle_gpu_demod()
-                        input_buffer = input_buffer[1:]
                     elif input_buffer[0] in ('d', 'D'):
                         # Toggle RDS diagnostics (d=start, D=dump to /tmp/rds_timing_diag.txt)
                         result = radio.toggle_rds_diagnostics()
@@ -2113,19 +1956,6 @@ def main():
         default=None,
         help="Force preamp on or off (IC-R8600 only, default: unchanged)"
     )
-    gpu_group = parser.add_mutually_exclusive_group()
-    gpu_group.add_argument(
-        "--gpu",
-        action="store_true",
-        dest="gpu_on",
-        help="Enable GPU acceleration (overrides config)"
-    )
-    gpu_group.add_argument(
-        "--no-gpu",
-        action="store_true",
-        dest="gpu_off",
-        help="Disable GPU acceleration (overrides config)"
-    )
 
     args = parser.parse_args()
 
@@ -2166,7 +1996,6 @@ def main():
     initial_freq = 89.9e6  # Default frequency
     use_icom = False  # Default device
     use_24bit = False  # Default 16-bit I/Q
-    gpu_enabled = True  # Default GPU on
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pyfm.cfg')
     if os.path.exists(config_path):
         config = configparser.ConfigParser()
@@ -2181,8 +2010,6 @@ def main():
                 use_icom = (device == 'icom')
             if config.has_option('radio', 'use_24bit'):
                 use_24bit = config.getboolean('radio', 'use_24bit')
-            if config.has_option('radio', 'gpu'):
-                gpu_enabled = config.getboolean('radio', 'gpu')
         except (ValueError, configparser.Error):
             pass
 
@@ -2201,12 +2028,6 @@ def main():
     # Command-line --24bit overrides config
     if args.use_24bit:
         use_24bit = True
-
-    # Command-line --gpu/--no-gpu overrides config
-    if args.gpu_on:
-        gpu_enabled = True
-    elif args.gpu_off:
-        gpu_enabled = False
 
     # Validate --24bit requires Icom
     if use_24bit and not use_icom:
@@ -2227,7 +2048,7 @@ def main():
 
     # Create radio instance
     radio = FMRadio(initial_freq=initial_freq, use_icom=use_icom, use_24bit=use_24bit,
-                    preamp=preamp_setting, gpu_enabled=gpu_enabled)
+                    preamp=preamp_setting)
 
     # Run rich UI
     try:

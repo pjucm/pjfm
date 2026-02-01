@@ -132,15 +132,6 @@ class FMStereoDecoder:
         self.treble_boost_enabled = True  # Default on
         self._setup_tone_filters()
 
-        # Optional GPU demodulator for baseband step
-        self.gpu_demodulator = None
-        # Optional GPU resampler for rate conversion step
-        self.gpu_resampler = None
-        # Optional GPU FIR bank (pilot_bpf, lr_sum_lpf, lr_diff_bpf — shared input)
-        self.gpu_fir_bank = None
-        # Optional GPU FIR filter for lr_diff_lpf (different input)
-        self.gpu_fir_lr_diff = None
-
         # Stereo blend settings (blend to mono when SNR is low)
         # Thresholds based on pilot SNR measurement:
         # - 8 dB: very weak signal, use mono to reduce noise
@@ -302,18 +293,11 @@ class FMStereoDecoder:
             t_total = time.perf_counter()
             t0 = t_total
 
-        # FM demodulation
-        if self.gpu_demodulator is not None:
-            # GPU arctangent-differentiate method
-            baseband = self.gpu_demodulator.demodulate(iq_samples)
-            # Still update last_sample for continuity if GPU is toggled off
-            self.last_sample = iq_samples[-1]
-        else:
-            # CPU quadrature discriminator
-            samples = np.concatenate([[self.last_sample], iq_samples])
-            self.last_sample = iq_samples[-1]
-            product = samples[1:] * np.conj(samples[:-1])
-            baseband = np.angle(product) * (self.iq_sample_rate / (2 * np.pi * self.deviation))
+        # FM demodulation (quadrature discriminator)
+        samples = np.concatenate([[self.last_sample], iq_samples])
+        self.last_sample = iq_samples[-1]
+        product = samples[1:] * np.conj(samples[:-1])
+        baseband = np.angle(product) * (self.iq_sample_rate / (2 * np.pi * self.deviation))
 
         # Store baseband for RDS processing (at IQ sample rate, before decimation)
         self._last_baseband = baseband
@@ -321,15 +305,10 @@ class FMStereoDecoder:
         if profiling:
             t0 = self._prof('fm_demod', t0)
 
-        # Extract pilot, L+R, and L-R subcarrier via GPU bank or CPU lfilter
-        if self.gpu_fir_bank is not None:
-            pilot, lr_sum, lr_diff_mod_raw = self.gpu_fir_bank.process(baseband)
-        else:
-            pilot, self.pilot_bpf_state = signal.lfilter(
-                self.pilot_bpf, 1.0, baseband, zi=self.pilot_bpf_state
-            )
-            lr_sum = None  # computed below
-            lr_diff_mod_raw = None
+        # Extract pilot (19 kHz)
+        pilot, self.pilot_bpf_state = signal.lfilter(
+            self.pilot_bpf, 1.0, baseband, zi=self.pilot_bpf_state
+        )
 
         # Store pilot for RDS decoder
         self._last_pilot = pilot  # No copy - pilot is fresh from filter
@@ -352,11 +331,10 @@ class FMStereoDecoder:
         else:
             self._pilot_detected = False
 
-        # Extract L+R (mono, 0-15 kHz) — may already be computed by GPU bank
-        if lr_sum is None:
-            lr_sum, self.lr_sum_lpf_state = signal.lfilter(
-                self.lr_sum_lpf, 1.0, baseband, zi=self.lr_sum_lpf_state
-            )
+        # Extract L+R (mono, 0-15 kHz)
+        lr_sum, self.lr_sum_lpf_state = signal.lfilter(
+            self.lr_sum_lpf, 1.0, baseband, zi=self.lr_sum_lpf_state
+        )
 
         # Apply group delay compensation: delay L+R to align with L-R path
         delay = self._lr_sum_delay
@@ -371,12 +349,9 @@ class FMStereoDecoder:
 
         if self._pilot_detected:
             # Extract L-R subcarrier region (23-53 kHz)
-            if lr_diff_mod_raw is not None:
-                lr_diff_mod = lr_diff_mod_raw
-            else:
-                lr_diff_mod, self.lr_diff_bpf_state = signal.lfilter(
-                    self.lr_diff_bpf, 1.0, baseband, zi=self.lr_diff_bpf_state
-                )
+            lr_diff_mod, self.lr_diff_bpf_state = signal.lfilter(
+                self.lr_diff_bpf, 1.0, baseband, zi=self.lr_diff_bpf_state
+            )
 
             if profiling:
                 t0 = self._prof('lr_diff_bpf', t0)
@@ -385,12 +360,9 @@ class FMStereoDecoder:
             lr_diff_demod = lr_diff_mod * carrier_38k * 2  # *2 for DSB-SC gain
 
             # Lowpass filter the demodulated L-R
-            if self.gpu_fir_lr_diff is not None:
-                lr_diff = self.gpu_fir_lr_diff.process(lr_diff_demod)
-            else:
-                lr_diff, self.lr_diff_lpf_state = signal.lfilter(
-                    self.lr_diff_lpf, 1.0, lr_diff_demod, zi=self.lr_diff_lpf_state
-                )
+            lr_diff, self.lr_diff_lpf_state = signal.lfilter(
+                self.lr_diff_lpf, 1.0, lr_diff_demod, zi=self.lr_diff_lpf_state
+            )
 
             if profiling:
                 t0 = self._prof('lr_diff_lpf', t0)

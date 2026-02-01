@@ -197,6 +197,25 @@ class BB60D:
     # The hardware FM demodulator is no longer used; all FM processing
     # is done via IQ streaming + FMStereoDecoder
 
+    def get_effective_sample_rate(self, sample_rate=250000):
+        """
+        Calculate the effective sample rate that would be used for a given request.
+
+        This allows callers to know the actual rate before starting IQ streaming,
+        which is useful for pre-initializing signal processing components.
+
+        Args:
+            sample_rate: Desired sample rate in Hz
+
+        Returns:
+            Actual sample rate that would be used (BB60D uses 40MHz / power-of-2)
+        """
+        base_rate = 40e6
+        decimation = int(base_rate / sample_rate)
+        # Round to nearest power of 2
+        decimation = max(1, min(8192, 2 ** int(np.log2(decimation) + 0.5)))
+        return base_rate / decimation
+
     def configure_iq_streaming(self, freq=None, sample_rate=250000):
         """
         Configure BB60D for IQ streaming (for software demodulation).

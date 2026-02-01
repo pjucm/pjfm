@@ -417,6 +417,35 @@ class IcomR8600:
         except usb.core.USBError as e:
             raise RuntimeError(f"Failed to read response: {e}")
 
+    def get_effective_sample_rate(self, sample_rate=250000):
+        """
+        Calculate the effective sample rate that would be used for a given request.
+
+        This allows callers to know the actual rate before starting IQ streaming,
+        which is useful for pre-initializing signal processing components.
+
+        Args:
+            sample_rate: Desired sample rate in Hz
+
+        Returns:
+            Actual sample rate that would be used (from available rates)
+        """
+        if self._use_24bit:
+            rate_table = SAMPLE_RATES_24BIT
+        else:
+            rate_table = SAMPLE_RATES
+
+        available_rates = sorted(rate_table.keys())
+        chosen_rate = available_rates[0]
+        for rate in available_rates:
+            if rate >= sample_rate:
+                chosen_rate = rate
+                break
+        else:
+            chosen_rate = available_rates[-1]
+
+        return chosen_rate
+
     def configure_iq_streaming(self, freq=None, sample_rate=250000):
         """
         Configure IC-R8600 for I/Q streaming.
