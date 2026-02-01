@@ -10,6 +10,7 @@ Linux: sudo access or udev rules for USB device
 """
 
 import numpy as np
+import os
 import usb.core
 import usb.util
 import threading
@@ -506,6 +507,13 @@ class IcomR8600:
 
     def _iq_reader_loop(self):
         """Background thread to continuously read I/Q data from USB."""
+        # Set SCHED_FIFO for this I/Q reader thread
+        try:
+            param = os.sched_param(50)
+            os.sched_setscheduler(0, os.SCHED_FIFO, param)
+        except (PermissionError, OSError):
+            pass  # Silently fall back to normal scheduling
+
         while self._running:
             try:
                 # Read large chunks for efficiency

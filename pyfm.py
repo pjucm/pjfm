@@ -750,6 +750,13 @@ class FMRadio:
 
     def _audio_loop(self):
         """Background thread for IQ capture, demodulation, and signal measurement."""
+        # Set SCHED_FIFO for this DSP thread
+        try:
+            param = os.sched_param(50)
+            os.sched_setscheduler(0, os.SCHED_FIFO, param)
+        except (PermissionError, OSError):
+            pass  # Silently fall back to normal scheduling
+
         # PI rate control state
         # Kp: proportional gain (50 ppm per ms error - fast response)
         # Ki: integral gain (slow drift correction, 5x reduction to reduce oscillation)
