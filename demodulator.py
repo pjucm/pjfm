@@ -47,14 +47,6 @@ class FMStereoDecoder:
         # State for continuous processing
         self.last_sample = complex(1, 0)
 
-        # Calculate resampling ratio
-        from math import gcd
-        iq_int = int(iq_sample_rate)
-        audio_int = int(audio_sample_rate)
-        g = gcd(iq_int, audio_int)
-        self.resample_up = audio_int // g
-        self.resample_down = iq_int // g
-
         # Adaptive rate control: adjusts resample ratio to match audio card clock
         # 1.0 = nominal, >1.0 = produce more samples (buffer low), <1.0 = fewer (buffer high)
         self._rate_adjust = 1.0
@@ -605,14 +597,6 @@ class NBFMDecoder:
 
         # State for continuous processing
         self.last_sample = complex(1, 0)
-
-        # Calculate resampling ratio
-        from math import gcd
-        iq_int = int(iq_sample_rate)
-        audio_int = int(audio_sample_rate)
-        g = gcd(iq_int, audio_int)
-        self.resample_up = audio_int // g
-        self.resample_down = iq_int // g
 
         # Adaptive rate control (same as FMStereoDecoder)
         self._rate_adjust = 1.0
