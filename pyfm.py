@@ -71,7 +71,7 @@ except ImportError as e:
     r8600_get_api_version = None
 
 from demodulator import FMStereoDecoder, NBFMDecoder
-from gpu import GPUFMDemodulator, GPUResampler, GPUFIRBank, GPUFIRFilter
+from gpu import GPUFMDemodulator, GPUFIRBank, GPUFIRFilter
 from rds_decoder import RDSDecoder, pi_to_callsign
 
 
