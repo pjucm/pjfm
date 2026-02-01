@@ -6,210 +6,9 @@ Provides FM stereo demodulation from IQ samples using quadrature demodulation
 with 19 kHz pilot detection and L-R subcarrier decoding.
 """
 
-import math
 import time
 import numpy as np
 from scipy import signal
-
-
-class PilotPLL:
-    """
-    Phase-Locked Loop for FM stereo pilot tracking.
-
-    Tracks the 19 kHz pilot tone and generates coherent
-    19 kHz and 38 kHz carriers for stereo decoding.
-
-    Uses a 2nd-order Type 2 PLL with proportional + integral
-    loop filter. The feedback loop runs at a decimated rate
-    (~4 kHz) since the pilot BPF output has only ~1 kHz
-    bandwidth. The tracked phase is interpolated back to full
-    rate and carriers are generated with vectorized numpy trig.
-
-    This reduces the Python for-loop from ~8192 iterations to
-    ~105 per block while preserving lock performance (the loop
-    bandwidth is 100 Hz, well below the ~2 kHz Nyquist of the
-    decimated rate).
-    """
-
-    # Target rate for the decimated PLL feedback loop (Hz).
-    # Must be > 2x loop bandwidth (100 Hz) for stability.
-    # 4 kHz gives 40x oversampling of the loop bandwidth.
-    PLL_RATE = 4000
-
-    def __init__(self, sample_rate, center_freq=19000,
-                 bandwidth=100, damping=0.707):
-        """
-        Initialize PLL.
-
-        Args:
-            sample_rate: Input sample rate in Hz
-            center_freq: Pilot frequency in Hz (19000)
-            bandwidth: Loop bandwidth in Hz (affects tracking speed vs noise)
-            damping: Damping factor (0.707 = critical damping)
-        """
-        self.sample_rate = sample_rate
-        self.center_freq = center_freq
-        self.bandwidth = bandwidth
-        self.damping = damping
-
-        # Loop filter coefficients (2nd-order Type 2)
-        omega_n = 2 * np.pi * bandwidth
-        self.Kp = 2 * damping * omega_n
-        self.Ki = omega_n ** 2
-
-        # State variables
-        self.phase = 0.0
-        self.freq_offset = 0.0
-        self.integrator = 0.0
-        self.locked = False
-
-        # Phase error variance tracking for pilot-referenced SNR
-        self._phase_error_var = 0.0  # EMA-smoothed variance
-
-        # Full-rate constants
-        self._dt = 1.0 / sample_rate
-        self._omega_0 = 2 * np.pi * center_freq
-
-        # Decimation factor: run feedback loop at ~PLL_RATE
-        self._decim = max(1, int(sample_rate / self.PLL_RATE))
-        # Decimated time step (for the feedback loop)
-        self._dt_decim = self._decim / sample_rate
-
-    def process(self, pilot_signal):
-        """
-        Process pilot signal through PLL.
-
-        The feedback loop runs on a decimated version of the pilot
-        signal. The resulting phase trajectory is interpolated to
-        full rate, then vectorized numpy trig generates the carriers.
-
-        Args:
-            pilot_signal: Filtered 19 kHz pilot samples (numpy array)
-
-        Returns:
-            tuple: (carrier_19k, carrier_38k, locked)
-                - carrier_19k: Coherent 19 kHz carrier
-                - carrier_38k: Coherent 38 kHz carrier for L-R demod
-                - locked: True if PLL is locked to pilot
-        """
-        n = len(pilot_signal)
-        decim = self._decim
-
-        # --- Decimated feedback loop ---
-        # Average the pilot signal over each decimation block to get
-        # a representative sample for phase detection.
-        n_decim = n // decim
-        remainder = n - n_decim * decim
-
-        # Reshape and average for decimation (fast, vectorized)
-        if n_decim > 0:
-            pilot_decim = pilot_signal[:n_decim * decim].reshape(n_decim, decim).mean(axis=1)
-        else:
-            pilot_decim = np.array([], dtype=pilot_signal.dtype)
-
-        # Handle remainder samples
-        if remainder > 0:
-            pilot_decim = np.append(pilot_decim, pilot_signal[n_decim * decim:].mean())
-            n_decim_total = n_decim + 1
-        else:
-            n_decim_total = n_decim
-
-        # Run scalar PLL at decimated rate — collect phase at each step
-        # We need phase values at decimated points, then interpolate
-        phase_points = np.empty(n_decim_total + 1, dtype=np.float64)
-        phase_points[0] = self.phase
-
-        phase = self.phase
-        integrator = self.integrator
-        freq_offset = self.freq_offset
-        dt_decim = self._dt_decim
-        omega_0 = self._omega_0
-        Kp = self.Kp
-        Ki = self.Ki
-
-        _sin = math.sin
-        _pi = math.pi
-        _two_pi = 2.0 * _pi
-
-        pe_sum = 0.0
-        pe_sq_sum = 0.0
-
-        for i in range(n_decim_total):
-            # Phase detector using current NCO phase vs decimated pilot
-            phase_error = pilot_decim[i] * _sin(phase)
-
-            pe_sum += phase_error
-            pe_sq_sum += phase_error * phase_error
-
-            # Loop filter (PI controller)
-            integrator += phase_error * Ki * dt_decim
-            freq_offset = Kp * phase_error + integrator
-
-            # Advance phase by one decimated step
-            phase += (omega_0 + freq_offset) * dt_decim
-
-            # Wrap phase (single wrap is sufficient — phase step is
-            # decim * omega_0 * dt ≈ decim * 0.38 rad, well under pi
-            # even for decim=78)
-            if phase > _pi:
-                phase -= _two_pi
-            elif phase < -_pi:
-                phase += _two_pi
-
-            phase_points[i + 1] = phase
-
-        # Store state
-        self.phase = phase
-        self.integrator = integrator
-        self.freq_offset = freq_offset
-
-        # Phase error variance (EMA-smoothed across blocks)
-        if n_decim_total > 1:
-            pe_mean = pe_sum / n_decim_total
-            pe_var = pe_sq_sum / n_decim_total - pe_mean * pe_mean
-            self._phase_error_var = 0.9 * self._phase_error_var + 0.1 * max(pe_var, 1e-20)
-
-        # Lock detection: frequency offset should be small when locked
-        # Within 50 Hz of center = locked
-        self.locked = abs(freq_offset) < 2 * np.pi * 50
-
-        # --- Interpolate phase to full rate (vectorized) ---
-        # phase_points[0] is the phase at sample 0 (start of block)
-        # phase_points[k] is the phase at sample k*decim
-        # We need phase at every sample 0..n-1
-
-        # Sample indices for the decimated phase points
-        decim_indices = np.arange(n_decim_total + 1) * decim
-        # Clamp last index to n for the remainder case
-        if remainder > 0:
-            decim_indices[-1] = n
-
-        # Full-rate sample indices
-        full_indices = np.arange(n)
-
-        # Linear interpolation of unwrapped phase
-        # Unwrap before interpolation to avoid discontinuities at ±pi
-        phase_unwrapped = np.unwrap(phase_points)
-        phase_full = np.interp(full_indices, decim_indices, phase_unwrapped)
-
-        # --- Vectorized carrier generation ---
-        carrier_19k = np.cos(phase_full)
-        carrier_38k = np.cos(2.0 * phase_full)
-
-        return carrier_19k, carrier_38k, self.locked
-
-    @property
-    def phase_error_variance(self):
-        """Return EMA-smoothed phase error variance for SNR estimation."""
-        return self._phase_error_var
-
-    def reset(self):
-        """Reset PLL state (call when changing frequency)."""
-        self.phase = 0.0
-        self.freq_offset = 0.0
-        self.integrator = 0.0
-        self.locked = False
-        self._phase_error_var = 0.0
 
 
 class FMStereoDecoder:
@@ -337,17 +136,6 @@ class FMStereoDecoder:
         self._last_baseband = None
         self._last_pilot = None
 
-        # PLL for pilot tracking (optional, default disabled due to aliasing bug)
-        # PLL decimates to ~4 kHz which aliases the 19 kHz pilot incorrectly
-        # Pilot-squaring fallback provides correct stereo decode
-        self.use_pll = False
-        self.pilot_pll = PilotPLL(
-            sample_rate=iq_sample_rate,
-            center_freq=19000,
-            bandwidth=50,     # 50 Hz loop bandwidth (cleaner carrier)
-            damping=0.707     # Critical damping
-        )
-
         # Tone controls (bass and treble boost)
         self.bass_boost_enabled = True    # Default on
         self.treble_boost_enabled = True  # Default on
@@ -376,7 +164,6 @@ class FMStereoDecoder:
         self._profile = {
             'fm_demod': 0.0,
             'pilot_bpf': 0.0,
-            'pll': 0.0,
             'lr_sum_lpf': 0.0,
             'lr_diff_bpf': 0.0,
             'lr_diff_lpf': 0.0,
@@ -564,24 +351,15 @@ class FMStereoDecoder:
         if profiling:
             t0 = self._prof('pilot_bpf', t0)
 
-        # Pilot detection: require both RMS threshold AND PLL lock (if using PLL)
-        # This prevents false positives from broadband noise on blank stations
+        # Pilot detection and 38 kHz carrier regeneration via pilot-squaring
+        # Uses trig identity: cos(2x) = 2*cos^2(x) - 1
         carrier_38k = None
         if self._pilot_level > self.pilot_threshold:
-            if self.use_pll:
-                # Run PLL to check for coherent tone lock
-                _, carrier_38k, pll_locked = self.pilot_pll.process(pilot)
-                self._pilot_detected = pll_locked
-            else:
-                # Legacy mode: use RMS threshold only
-                pilot_normalized = pilot / (np.abs(pilot).max() + 1e-10)
-                carrier_38k = 2 * pilot_normalized ** 2 - 1  # cos(2x) = 2cos^2(x) - 1
-                self._pilot_detected = True
+            pilot_normalized = pilot / (np.abs(pilot).max() + 1e-10)
+            carrier_38k = 2 * pilot_normalized ** 2 - 1
+            self._pilot_detected = True
         else:
             self._pilot_detected = False
-
-        if profiling:
-            t0 = self._prof('pll', t0)
 
         # Extract L+R (mono, 0-15 kHz) — may already be computed by GPU bank
         if lr_sum is None:
@@ -749,17 +527,6 @@ class FMStereoDecoder:
 
         return np.column_stack((left, right))
 
-    def set_carrier_mode(self, use_pll=True):
-        """
-        Set carrier regeneration mode.
-
-        Args:
-            use_pll: True for PLL-based (default), False for pilot-squaring
-        """
-        self.use_pll = use_pll
-        if use_pll:
-            self.pilot_pll.reset()
-
     def set_bass_boost(self, enabled):
         """Enable or disable +3dB bass boost at 250 Hz."""
         self.bass_boost_enabled = enabled
@@ -799,9 +566,6 @@ class FMStereoDecoder:
 
         # Reset group delay compensation buffer
         self._lr_sum_delay_buf = np.zeros(self._lr_sum_delay, dtype=np.float64)
-
-        # Reset PLL state
-        self.pilot_pll.reset()
 
         # Reset SNR state
         self._snr_db = 0.0

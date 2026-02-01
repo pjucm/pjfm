@@ -1757,7 +1757,6 @@ def build_display(radio, width=80):
             stages = [
                 ('fm_demod', 'FM Demod'),
                 ('pilot_bpf', 'Pilot BPF'),
-                ('pll', 'PLL'),
                 ('lr_sum_lpf', 'L+R LPF'),
                 ('lr_diff_bpf', 'L-R BPF'),
                 ('lr_diff_lpf', 'L-R LPF'),
