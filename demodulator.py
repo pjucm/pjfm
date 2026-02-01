@@ -46,7 +46,6 @@ class FMStereoDecoder:
 
         # State for continuous processing
         self.last_sample = complex(1, 0)
-        self.pilot_phase = 0.0
 
         # Calculate resampling ratio
         from math import gcd
@@ -551,7 +550,6 @@ class FMStereoDecoder:
         self.last_sample = complex(1, 0)
         self._pilot_detected = False
         self._pilot_level = 0.0
-        self.pilot_phase = 0.0
         self._last_baseband = None
 
         # Reset filter states
