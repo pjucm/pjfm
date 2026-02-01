@@ -67,13 +67,11 @@ Broadcast FM stereo uses a pilot-tone multiplexing system defined by the FCC:
 | 23-53 kHz | L-R on 38 kHz DSB-SC carrier |
 | 57 kHz | RDS subcarrier (optional) |
 
-**Pilot Detection**: A 4th-order Butterworth bandpass filter (18.5-19.5 kHz) extracts the pilot tone. A Phase-Locked Loop (PLL) tracks the pilot with 50 Hz loop bandwidth and 0.707 damping factor (critically damped), providing:
-- Coherent lock detection (prevents false stereo on noise)
-- Phase-accurate 38 kHz carrier regeneration for L-R demodulation
+**Pilot Detection**: A Kaiser-windowed FIR bandpass filter (18.5-19.5 kHz) extracts the 19 kHz pilot tone. Pilot presence is detected by RMS level threshold.
 
-**Stereo Matrix Decoding**:
+**Stereo Matrix Decoding**: The 38 kHz carrier is regenerated using pilot-squaring, which exploits the trig identity cos(2x) = 2cos²(x) - 1:
 ```
-L-R carrier = 2 * cos(2 * pilot_phase)  // PLL-derived
+L-R carrier = 2 * pilot² - 1  // pilot-squaring
 L-R = BPF(baseband, 23-53 kHz) * carrier * 2
 Left  = (L+R) + (L-R)
 Right = (L+R) - (L-R)
@@ -271,9 +269,9 @@ pip install torch  # ROCm or CUDA version
               │                     │                     │
               │                     ▼                     ▼
               │              ┌──────────────┐      ┌──────────────┐
-              │              │     PLL      │      │  Coherent    │
-              │              │   Tracker    │      │   Demod      │
-              │              │  (50 Hz BW)  │      └──────────────┘
+              │              │    Pilot     │      │  Coherent    │
+              │              │   Squaring   │      │   Demod      │
+              │              │  (2p²-1)     │      └──────────────┘
               │              └──────────────┘             │
               │                     │                     ▼
               │                     ▼              ┌──────────────┐
