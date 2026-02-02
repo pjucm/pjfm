@@ -71,6 +71,10 @@ SYNC_INTERVAL = {
     240000:  512,
 }
 
+# Maximum I/Q buffer size to prevent unbounded memory growth
+# If fetch_iq() is called slower than USB read rate, buffer is trimmed
+MAX_IQ_BUFFER_BYTES = 5 * 1024 * 1024  # 5 MB
+
 
 def _build_civ_command(cmd_data):
     """Build a CI-V command packet with even-length padding."""
@@ -311,6 +315,7 @@ class IcomR8600:
         self._fetch_slow_count = 0  # Count of slow fetch_iq calls
         self._fetch_slow_threshold_ms = 50.0  # Slow fetch threshold in ms
         self._civ_timeouts = 0  # Count of CI-V response timeouts
+        self._buffer_overflow_count = 0  # Count of buffer overflow events
         self._iq_lock = threading.Lock()
         self._iq_thread = None
         self._running = False
@@ -538,6 +543,14 @@ class IcomR8600:
                 if data:
                     with self._iq_lock:
                         self._iq_buffer.append(bytes(data))
+                        # Prevent unbounded buffer growth if fetch_iq() is slow
+                        total_size = sum(len(chunk) for chunk in self._iq_buffer)
+                        if total_size > MAX_IQ_BUFFER_BYTES:
+                            self._buffer_overflow_count += 1
+                            # Drop oldest chunks to get below half the limit
+                            while (self._iq_buffer and
+                                   sum(len(chunk) for chunk in self._iq_buffer) > MAX_IQ_BUFFER_BYTES // 2):
+                                self._iq_buffer.pop(0)
             except usb.core.USBTimeoutError:
                 continue
             except usb.core.USBError:
@@ -576,7 +589,10 @@ class IcomR8600:
             sync_bytes = b"\x00\x80\x01\x80\x02\x80"
             sample_size = 6
 
-        bytes_needed = num_samples * sample_size + len(sync_bytes) * (num_samples // 1024 + 2)
+        # Calculate bytes needed based on actual sync interval for this sample rate
+        sync_interval = SYNC_INTERVAL.get(self.iq_sample_rate, 1024)
+        syncs_expected = num_samples // sync_interval + 2
+        bytes_needed = num_samples * sample_size + len(sync_bytes) * syncs_expected
 
         # Collect raw bytes from USB reader thread
         timeout = time.time() + 1.0
@@ -794,6 +810,36 @@ class IcomR8600:
         self._dc_offset = 0.0 + 0.0j
         self.total_sample_loss = 0
         self.recent_sample_loss = 0
+
+    def get_diagnostics(self):
+        """
+        Return dictionary of diagnostic counters for monitoring stream health.
+
+        Returns:
+            dict with keys:
+                sync_misses: Count of missing sync patterns (should be 0)
+                sync_invalid_24: Count of 24-bit samples rejected as out of range
+                buffer_overflow_count: Count of buffer overflow trim events
+                total_sample_loss: Total fetch calls that returned fewer samples
+                recent_sample_loss: Consecutive sample loss events (resets on success)
+                fetch_last_ms: Duration of last fetch_iq() call in milliseconds
+                fetch_slow_count: Count of fetch calls exceeding slow threshold
+                civ_timeouts: Count of CI-V command timeouts
+                initial_aligns: Count of initial stream alignment operations
+                flush_during_fetch: Count of flush_iq() called while fetch active
+        """
+        return {
+            'sync_misses': self._sync_misses,
+            'sync_invalid_24': self._sync_invalid_24,
+            'buffer_overflow_count': self._buffer_overflow_count,
+            'total_sample_loss': self.total_sample_loss,
+            'recent_sample_loss': self.recent_sample_loss,
+            'fetch_last_ms': self._fetch_last_ms,
+            'fetch_slow_count': self._fetch_slow_count,
+            'civ_timeouts': self._civ_timeouts,
+            'initial_aligns': self._initial_aligns,
+            'flush_during_fetch': self._flush_during_fetch,
+        }
 
     def set_frequency(self, freq):
         """Change the tuned frequency."""
