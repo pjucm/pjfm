@@ -473,7 +473,7 @@ def test_hardware_sync_all_rates():
         return True  # Skip, not fail
 
     try:
-        radio = IcomR8600(sample_rate=480000, use_24bit=False)
+        radio = IcomR8600(use_24bit=False)
         radio.open()
     except Exception as e:
         print(f"\n  SKIP: Cannot connect to IC-R8600: {e}")
@@ -485,17 +485,17 @@ def test_hardware_sync_all_rates():
         for sample_rate in [240000, 480000, 960000]:
             print(f"\n  Testing {sample_rate/1000:.0f} kHz...")
 
-            # Reconfigure
-            radio.stop_iq()
-            time.sleep(0.2)
-            radio.iq_sample_rate = sample_rate
-            radio.start_iq(sample_rate)
+            # Configure streaming at this sample rate
+            radio.configure_iq_streaming(freq=98.1e6, sample_rate=sample_rate)
             time.sleep(0.5)
+            radio.flush_iq()
+            time.sleep(0.2)
 
-            # Collect samples and check diagnostics
+            # Reset counters
             radio._sync_misses = 0
             radio._sync_invalid_24 = 0
 
+            # Collect samples
             for _ in range(100):
                 iq = radio.fetch_iq(8192)
 
@@ -537,10 +537,11 @@ def test_hardware_long_duration():
         return True
 
     try:
-        radio = IcomR8600(sample_rate=480000, use_24bit=False)
+        radio = IcomR8600(use_24bit=False)
         radio.open()
-        radio.start_iq()
+        radio.configure_iq_streaming(freq=98.1e6, sample_rate=480000)
         time.sleep(0.5)
+        radio.flush_iq()
     except Exception as e:
         print(f"\n  SKIP: Cannot connect to IC-R8600: {e}")
         return True
@@ -549,6 +550,7 @@ def test_hardware_long_duration():
     fetch_count = 0
     total_samples = 0
     max_fetch_ms = 0
+    last_print_sec = -1
 
     # Reset counters
     radio._sync_misses = 0
@@ -567,13 +569,13 @@ def test_hardware_long_duration():
             total_samples += len(iq)
             max_fetch_ms = max(max_fetch_ms, fetch_ms)
 
-            # Progress indicator
-            elapsed = time.time() - start
-            if int(elapsed) % 10 == 0 and elapsed > 0:
-                print(f"    {int(elapsed)}s: {fetch_count} fetches, "
+            # Progress indicator every 10 seconds
+            elapsed_sec = int(time.time() - start)
+            if elapsed_sec % 10 == 0 and elapsed_sec != last_print_sec and elapsed_sec > 0:
+                last_print_sec = elapsed_sec
+                print(f"    {elapsed_sec}s: {fetch_count} fetches, "
                       f"sync_misses={radio._sync_misses}, "
                       f"sample_loss={radio.total_sample_loss}")
-                time.sleep(0.1)  # Avoid duplicate prints
 
     finally:
         radio.close()
@@ -594,7 +596,7 @@ def test_hardware_long_duration():
 
 def test_hardware_diagnostics_api():
     """
-    Test that diagnostic counters are accessible and meaningful.
+    Test that diagnostic counters are accessible via get_diagnostics().
     """
     print("\n" + "=" * 70)
     print("Test: Diagnostic Counters API")
@@ -607,10 +609,11 @@ def test_hardware_diagnostics_api():
         return True
 
     try:
-        radio = IcomR8600(sample_rate=480000, use_24bit=False)
+        radio = IcomR8600(use_24bit=False)
         radio.open()
-        radio.start_iq()
+        radio.configure_iq_streaming(freq=98.1e6, sample_rate=480000)
         time.sleep(0.5)
+        radio.flush_iq()
     except Exception as e:
         print(f"\n  SKIP: Cannot connect to IC-R8600: {e}")
         return True
@@ -620,36 +623,34 @@ def test_hardware_diagnostics_api():
         for _ in range(50):
             radio.fetch_iq(8192)
 
-        # Check all diagnostic attributes exist
-        diagnostics = {
-            '_sync_misses': radio._sync_misses,
-            '_sync_short_buf': radio._sync_short_buf,
-            '_sync_invalid_24': radio._sync_invalid_24,
-            '_initial_aligns': radio._initial_aligns,
-            '_fetch_last_ms': radio._fetch_last_ms,
-            '_fetch_slow_count': radio._fetch_slow_count,
-            '_civ_timeouts': radio._civ_timeouts,
-            'total_sample_loss': radio.total_sample_loss,
-            'recent_sample_loss': radio.recent_sample_loss,
-        }
+        # Test get_diagnostics() method
+        diagnostics = radio.get_diagnostics()
 
-        print("\n  Available diagnostics:")
+        print("\n  get_diagnostics() output:")
         for name, value in diagnostics.items():
             print(f"    {name}: {value}")
 
-        # All attributes should exist (not raise AttributeError)
-        all_exist = True
+        # Verify expected keys exist
+        expected_keys = [
+            'sync_misses', 'sync_invalid_24', 'buffer_overflow_count',
+            'total_sample_loss', 'recent_sample_loss', 'fetch_last_ms',
+            'fetch_slow_count', 'civ_timeouts', 'initial_aligns', 'flush_during_fetch'
+        ]
+
+        missing_keys = [k for k in expected_keys if k not in diagnostics]
+        if missing_keys:
+            print(f"\n  Missing keys: {missing_keys}")
+            all_exist = False
+        else:
+            print(f"\n  All {len(expected_keys)} expected keys present")
+            all_exist = True
 
     except AttributeError as e:
-        print(f"\n  Missing diagnostic: {e}")
+        print(f"\n  Missing get_diagnostics() method: {e}")
         all_exist = False
 
     finally:
         radio.close()
-
-    print("\n  RECOMMENDATION:")
-    print("    Add get_diagnostics() method returning dict of all counters")
-    print("    Add reset_diagnostics() method to clear counters")
 
     print(f"\n  Result: {'PASS' if all_exist else 'FAIL'}")
     return all_exist
