@@ -6,7 +6,7 @@ in software, and plays audio through the default Linux audio device.
 ## Supported Hardware
 
 - **SignalHound BB60D** - Spectrum analyzer with I/Q streaming at 312.5 kHz
-- **Icom IC-R8600** - Communications receiver with USB I/Q output at 240-5120 kHz
+- **Icom IC-R8600** - Communications receiver with USB I/Q output at 240 kHz - 5.12 MHz
 
 ## Running
 
@@ -31,7 +31,6 @@ in software, and plays audio through the default Linux audio device.
 | b | Toggle bass boost (+3 dB) |
 | t | Toggle treble boost (+3 dB) |
 | a | Toggle spectrum analyzer |
-| G | Toggle GPU acceleration (FM mode) |
 | Q | Toggle squelch |
 | q | Quit |
 
@@ -39,33 +38,55 @@ in software, and plays audio through the default Linux audio device.
 
 ```bash
 pip install numpy scipy sounddevice rich pyusb  # pyusb for IC-R8600
-pip install torch  # Optional: GPU acceleration (ROCm or CUDA)
 ```
 
 ## Architecture
 
 ### Core Components
 
-- `pyfm.py` - Main application, terminal UI, audio playback
-- `demodulator.py` - FM stereo decoder with PLL-based pilot tracking
-- `rds_decoder.py` - RDS/RBDS decoding (station ID, program type, radio text)
+- `pyfm.py` - Main CLI application with terminal UI (Rich), audio playback, spectrum analyzer
+- `panadapter.py` - PyQt5 GUI with spectrum/waterfall display and FM demodulation
+- `demodulator.py` - FM stereo decoder (FMStereoDecoder) and NBFM decoder (NBFMDecoder)
+- `rds_decoder.py` - RDS/RBDS decoding (station ID, program type, radio text, clock)
 - `bb60d.py` - SignalHound BB60D I/Q streaming interface
 - `icom_r8600.py` - IC-R8600 USB I/Q interface with CI-V control
-- `gpu.py` - GPU-accelerated FM demod, FIR filters, polyphase resampler
 
-### IC-R8600 I/Q Interface
+### pyfm.py Architecture
 
-The IC-R8600 requires firmware upload on USB connection (automatic):
+Main classes:
+- **FMRadio** - Application controller, coordinates device, demodulators, audio, and UI
+- **AudioPlayer** - Ring buffer audio output with adaptive PI rate control
+- **SpectrumAnalyzer** - 16-band audio FFT with peak hold (ModPlug-style bars)
+
+Key features:
+- Adaptive rate control using PI controller to match audio card clock drift
+- Real-time scheduling (SCHED_FIFO) when CAP_SYS_NICE is available
+- Automatic RDS enable when pilot tone detected
+- Persistent config (presets, tone settings, last frequency)
+
+### IC-R8600 I/Q Interface (icom_r8600.py)
+
+**Initialization**:
+- Automatic Cypress FX2 firmware upload when device in bootloader mode (PID 0x0022)
 - Firmware file: `IC-R8600_usb_iq.spt` (from Icom USB I/Q Package for HDSDR)
-- Place in `~/dev/`, `~/.local/share/pyfm/`, or same directory as script
+- Search paths: script directory, `~/dev/`, `~/.local/share/pyfm/`
 
-Sample rates: 240 kHz, 480 kHz, 960 kHz, 1.92 MHz, 3.84 MHz, 5.12 MHz
-Bit depth: 16-bit (default), 24-bit available (needs testing)
+**Sample Rates**: 240 kHz, 480 kHz, 960 kHz, 1.92 MHz, 3.84 MHz, 5.12 MHz
+**Bit Depth**: 16-bit (default), 24-bit (available at all rates except 5.12 MHz)
 
-Per Icom I/Q Reference Guide:
-- Sync patterns inserted periodically (filtered out automatically)
-- DC offset present in I/Q data (removed via EMA tracking)
-- Valid sample range: -32767 to +32767 (16-bit)
+**I/Q Stream Processing** (per Icom I/Q Reference Guide):
+- Sync pattern filtering: 0x8000,0x8000 (16-bit) or 0x8000,0x8001,0x8002 (24-bit)
+- DC offset removal via EMA tracking (alpha=0.001)
+- Sync interval verification for alignment validation
+- Background reader thread for continuous USB bulk transfers
+
+**CI-V Protocol Commands**:
+- 0x1A 0x13: I/Q mode enable/disable, sample rate selection
+- 0x05: Frequency tuning (BCD format)
+- 0x14 0x02: RF gain control (0-255)
+- 0x11: Attenuator (0/10/20/30 dB)
+- 0x16 0x02: Preamplifier on/off
+- 0x16 0x65: IP+ (Intercept Point Plus) on/off
 
 ### Signal Processing
 
@@ -74,38 +95,59 @@ Per Icom I/Q Reference Guide:
 baseband = angle(s[n] * conj(s[n-1])) * (sample_rate / (2π * deviation))
 ```
 
-**Stereo Decoding**: PLL tracks 19 kHz pilot, regenerates 38 kHz carrier for L-R demod
+**Stereo Decoding** (FMStereoDecoder):
+- 19 kHz pilot BPF with Kaiser window (201 taps)
+- Pilot-squaring for 38 kHz carrier regeneration
+- L+R/L-R bandpass filtering and matrix decoding
+- SNR-based stereo blend (mono below 15 dB, full stereo above 30 dB)
+- 75 µs de-emphasis filter
 
-**Weather Radio**: NBFM with 5 kHz deviation for NOAA NWS (162.400-162.550 MHz)
+**Weather Radio** (NBFMDecoder): NBFM with 5 kHz deviation for NOAA NWS (162.400-162.550 MHz)
 
-**GPU Acceleration**: PyTorch-based (ROCm/CUDA) for:
-- FM demodulation (arctangent + differentiation)
-- FIR filter bank (pilot BPF, L+R LPF, L-R BPF)
-- Polyphase resampler (IQ rate → 48 kHz audio)
+## Panadapter GUI (panadapter.py)
 
-## Panadapter GUI
-
-`panadapter.py` is a PyQt5-based spectrum analyzer with waterfall display.
+PyQt5-based spectrum analyzer with waterfall display for Weather Radio and FM broadcast.
 
 ### Running
 
 ```bash
+# With BB60D (default)
 python panadapter.py [--freq FREQ_MHZ]
+
+# With IC-R8600
+python panadapter.py --icom [--freq FREQ_MHZ]
+python panadapter.py --icom --24bit                 # 24-bit I/Q
+python panadapter.py --icom --sample-rate 960000    # Custom sample rate
 ```
 
-Default center frequency: 162.500 MHz (NOAA weather radio band)
+### Architecture
+
+**Main Classes**:
+- **MainWindow** - Application window with mode switching (Weather/FM Broadcast)
+- **SpectrumWidget** - Real-time FFT spectrum with click-to-tune
+- **WaterfallWidget** - Scrolling waterfall display with viridis-style colormap
+- **SMeterWidget** - S-meter display (S9 = -93 dBm, 6 dB/S-unit)
+- **DataThread** - Background I/Q acquisition with rate-limited display updates (~30 fps)
+- **AudioOutput** - Ring buffer audio output with volume control
+
+**Demodulators**:
+- **NBFMDemodulator** - NBFM for weather radio (5 kHz deviation, optional hum filter)
+- **WBFMStereoDemodulator** - Wraps FMStereoDecoder with decimation for higher sample rates
 
 ### Features
 
-- Real-time spectrum display with peak hold (press 'P' to toggle)
-- Scrolling waterfall display with viridis colormap
-- NOAA weather radio preset buttons (WX1-WX7)
-- Keyboard controls: Left/Right arrows (±25 kHz), Up/Down (±100 kHz)
-- Direct frequency entry
-- FM demodulation with audio output
+- Dual mode: Weather Radio (NBFM) and FM Broadcast (WBFM stereo)
+- Real-time spectrum with exponential averaging and peak hold
+- Click-to-tune on spectrum or waterfall
+- S-meter with dBm readout
+- Stereo indicator and SNR display (FM mode)
+- NOAA preset buttons (WX1-WX7)
+- Squelch with visual indicator
+- Persistent config (device, frequency, mode, spectrum span)
 
 ### Dependencies
 
 ```bash
-pip install PyQt5 pyqtgraph
+pip install PyQt5 pyqtgraph numpy scipy sounddevice
+pip install pyusb  # For IC-R8600
 ```

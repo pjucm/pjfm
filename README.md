@@ -135,25 +135,51 @@ RDS data is organized into 26-bit blocks (16 data + 10 checkword), grouped into 
 - 0x1000-0x54A7: K stations (KAAA-KZZZ)
 - 0x54A8-0x994F: W stations (WAAA-WZZZ)
 
-### GPU Acceleration
+### Adaptive Rate Control
 
-pyfm supports GPU-accelerated signal processing via PyTorch (ROCm for AMD, CUDA for NVIDIA):
+pyfm uses a PI (proportional-integral) controller to match the I/Q sample rate to the audio card clock:
 
-- **FM Demodulation**: Arctangent and differentiation on GPU
-- **FIR Filter Bank**: Parallel pilot BPF, L+R LPF, L-R BPF computation
-- **Polyphase Resampler**: Efficient sample rate conversion with ~80 dB stopband
-
-GPU processing is enabled by default when available (toggle with 'G' key).
+- **Problem**: Clock drift between I/Q source and audio output causes buffer underruns/overruns
+- **Solution**: Monitor audio buffer level and adjust resample ratio in real-time
+- **Parameters**: Kp = 15 ppm/ms, Ki = 36 ppm/ms/s, with low-pass filtered error signal
+- **Performance**: Settles to ±5ms of target within 3-12 seconds, compensates up to ±400 ppm drift
 
 ### IC-R8600 I/Q Processing
 
 The IC-R8600 USB I/Q interface requires special handling per the Icom I/Q Reference Guide:
 
-- **Firmware Upload**: Automatic Cypress FX2 firmware upload on connection
-- **Sync Pattern Filtering**: Periodic sync markers (0x8000, 0x8000 for 16-bit) are removed
-- **DC Offset Removal**: EMA-tracked DC component subtracted from samples
-- **Sample Rates**: 240 kHz to 5.12 MHz (480 kHz typical for FM)
-- **Bit Depth**: 16-bit (default), 24-bit supported but needs testing
+- **Firmware Upload**: Automatic Cypress FX2 firmware upload on connection (two-stage)
+- **Sync Pattern Filtering**: Periodic sync markers removed (0x8000,0x8000 for 16-bit; 0x8000,0x8001,0x8002 for 24-bit)
+- **DC Offset Removal**: EMA-tracked DC component subtracted from samples (alpha=0.001)
+- **Sample Rates**: 240 kHz, 480 kHz, 960 kHz, 1.92 MHz, 3.84 MHz, 5.12 MHz
+- **Bit Depth**: 16-bit (default), 24-bit at all rates except 5.12 MHz
+
+#### IC-R8600 CI-V Protocol
+
+The icom_r8600.py module implements Icom's CI-V protocol for radio control:
+
+| Command | Function |
+|---------|----------|
+| 0x1A 0x13 0x00 | I/Q mode enable/disable |
+| 0x1A 0x13 0x01 | I/Q output enable with sample rate |
+| 0x05 | Set frequency (5-byte BCD) |
+| 0x14 0x02 | RF gain (0-255) |
+| 0x11 | Attenuator (0/10/20/30 dB) |
+| 0x16 0x02 | Preamplifier on/off |
+| 0x16 0x65 | IP+ on/off |
+
+#### IC-R8600 Sync Intervals
+
+Sync patterns are inserted at fixed sample intervals based on sample rate:
+
+| Sample Rate | Sync Interval (samples) |
+|-------------|------------------------|
+| 5.12 MHz | 10923 |
+| 3.84 MHz | 8192 |
+| 1.92 MHz | 4096 |
+| 960 kHz | 2048 |
+| 480 kHz | 1024 |
+| 240 kHz | 512 |
 
 ### Audio Processing
 
@@ -208,7 +234,6 @@ output = tanh(input * 1.5) / tanh(1.5)
 | b | Toggle bass boost |
 | t | Toggle treble boost |
 | a | Toggle spectrum analyzer |
-| G | Toggle GPU acceleration (FM mode) |
 | Q | Toggle squelch |
 | q | Quit |
 
@@ -237,8 +262,8 @@ pip install numpy scipy sounddevice rich
 # For IC-R8600 support
 pip install pyusb
 
-# For GPU acceleration (optional)
-pip install torch  # ROCm or CUDA version
+# For panadapter GUI
+pip install PyQt5 pyqtgraph
 ```
 
 ## Architecture Diagram
@@ -246,7 +271,7 @@ pip install torch  # ROCm or CUDA version
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                    SignalHound BB60D  OR  Icom IC-R8600                 │
-│                        IQ Streaming @ 250-480 kHz                       │
+│                        IQ Streaming @ 312-480 kHz                       │
 └─────────────────────────────────────────────────────────────────────────┘
                                     │
                           ┌─────────┴─────────┐
@@ -257,7 +282,6 @@ pip install torch  # ROCm or CUDA version
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                        Quadrature Discriminator                          │
 │                   baseband = angle(s[n] * conj(s[n-1]))                 │
-│                        (GPU accelerated if available)                    │
 └─────────────────────────────────────────────────────────────────────────┘
                                     │
               ┌─────────────────────┼─────────────────────┐
@@ -310,6 +334,77 @@ pip install torch  # ROCm or CUDA version
       └──────────────┘
 ```
 
+## Panadapter GUI
+
+`panadapter.py` provides a PyQt5-based spectrum analyzer with waterfall display, supporting both Weather Radio (NBFM) and FM Broadcast (WBFM stereo) modes.
+
+### Panadapter Usage
+
+```bash
+# With BB60D (default)
+python panadapter.py [--freq FREQ_MHZ] [--mode weather|fm]
+
+# With IC-R8600
+python panadapter.py --icom [--freq FREQ_MHZ]
+python panadapter.py --icom --24bit                 # 24-bit I/Q samples
+python panadapter.py --icom --sample-rate 960000    # Custom sample rate
+```
+
+### Panadapter Features
+
+- **Dual Mode Operation**: Weather Radio (NBFM) and FM Broadcast (WBFM stereo)
+- **Real-time Spectrum**: FFT with exponential averaging and peak hold (press 'P')
+- **Waterfall Display**: Scrolling time-frequency display with blue gradient colormap
+- **Click-to-Tune**: Click spectrum or waterfall to tune to frequency
+- **S-Meter**: Signal strength with S-units and dBm readout
+- **Stereo Indicator**: Shows MONO/STEREO status and blend percentage (FM mode)
+- **SNR Display**: Real-time SNR estimate from pilot reference (FM mode)
+- **NOAA Presets**: Quick buttons for WX1-WX7 weather channels
+- **Hum Filter**: High-pass filter for NWS low-frequency hum (Weather mode)
+- **Persistent Config**: Saves device, frequency, mode, and spectrum span settings
+
+### Panadapter Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    SignalHound BB60D  OR  Icom IC-R8600                 │
+│                        IQ Streaming @ 480-1250 kHz                      │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                          ┌─────────┴─────────┐
+                          │    DataThread     │
+                          │  (30 fps updates) │
+                          └─────────┬─────────┘
+                                    │
+              ┌─────────────────────┼─────────────────────┐
+              ▼                     ▼                     ▼
+      ┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+      │ Spectrum FFT │      │  Demodulator │      │  S-Meter     │
+      │   (4096 pt)  │      │ NBFM or WBFM │      │  Calculation │
+      └──────────────┘      └──────────────┘      └──────────────┘
+              │                     │                     │
+              ▼                     ▼                     ▼
+      ┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+      │ SpectrumWidget│     │ AudioOutput  │      │ SMeterWidget │
+      │ (pyqtgraph)  │      │ (48 kHz)     │      │              │
+      └──────────────┘      └──────────────┘      └──────────────┘
+              │
+              ▼
+      ┌──────────────┐
+      │ Waterfall    │
+      │   Widget     │
+      └──────────────┘
+```
+
+### Panadapter Keyboard Controls
+
+| Key | Function |
+|-----|----------|
+| ←/→ | Tune ±25 kHz (Weather) or ±100 kHz (FM) |
+| ↑/↓ | Tune ±100 kHz (Weather) or ±400 kHz (FM) |
+| P | Toggle peak hold |
+| Q / Esc | Quit |
+
 ## License
 
 Copyright (c) 2026 Phil Jensen. All rights reserved.
@@ -319,4 +414,5 @@ Copyright (c) 2026 Phil Jensen. All rights reserved.
 - SignalHound for the BB60D API
 - Icom for the IC-R8600 I/Q Reference Guide
 - The Rich library for terminal UI
+- PyQt5 and pyqtgraph for panadapter GUI
 - IEC 62106 (RDS specification)
