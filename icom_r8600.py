@@ -482,7 +482,13 @@ class IcomR8600:
         if resp and CIV_NG in resp:
             raise RuntimeError("Failed to set frequency")
 
-        # Query and display current RF settings (don't override user's radio settings)
+        # Set optimal RF settings for I/Q streaming (per HDSDR capture)
+        # These settings revert when exiting I/Q mode (per Icom I/Q Reference Guide p.13)
+        # ATT=0dB and RF Gain=255 for maximum sensitivity
+        self._send_command(_build_civ_command([0x11, 0x00]))  # Attenuator OFF
+        self._send_command(_build_civ_command([0x14, 0x02, 0x02, 0x55]))  # RF Gain 255 (BCD: 0255)
+
+        # Query and display current RF settings
         rf_settings = self.query_rf_settings()
         if rf_settings:
             print(f"RF Settings: Gain={rf_settings.get('rf_gain', '?')}, "
