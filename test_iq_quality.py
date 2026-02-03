@@ -6,6 +6,7 @@ Analyzes the raw I/Q data quality and FM demodulation to understand
 why SNR might be low despite strong signals.
 """
 
+import argparse
 import sys
 import time
 import numpy as np
@@ -13,23 +14,61 @@ import numpy as np
 sys.path.insert(0, '/home/philj/dev/pjfm')
 import icom_r8600 as r8600
 
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="I/Q Quality Diagnostic for IC-R8600"
+    )
+    parser.add_argument(
+        "freq_mhz",
+        nargs="?",
+        type=float,
+        default=88.1,
+        help="Center frequency in MHz (default: 88.1)"
+    )
+    parser.add_argument(
+        "--sample-rate",
+        type=int,
+        default=480000,
+        help="Requested I/Q sample rate in Hz (default: 480000)"
+    )
+    parser.add_argument(
+        "--bit-depth",
+        type=int,
+        choices=[16, 24],
+        default=24,
+        help="Requested I/Q bit depth (default: 24)"
+    )
+    parser.add_argument(
+        "--iq-gain",
+        type=float,
+        default=1.0,
+        help="Software I/Q gain (post-ADC scaling, default: 1.0)"
+    )
+    return parser.parse_args()
+
 def main():
+    args = parse_args()
+
     print("=" * 60)
     print("I/Q Quality Diagnostic")
     print("=" * 60)
 
-    radio = r8600.IcomR8600()
+    use_24bit = args.bit_depth == 24
+    radio = r8600.IcomR8600(use_24bit=use_24bit)
 
     try:
         radio.open()
 
         # Get frequency from command line or use default
-        freq = 88.1e6 if len(sys.argv) < 2 else float(sys.argv[1]) * 1e6
+        freq = args.freq_mhz * 1e6
         print(f"\nFrequency: {freq/1e6:.1f} MHz")
 
         # Configure streaming with unity gain to see raw levels
-        radio._iq_gain = 1.0  # Unity gain for analysis
-        radio.configure_iq_streaming(freq=freq, sample_rate=480000)
+        radio.iq_gain = args.iq_gain  # Unity gain for analysis
+        radio.configure_iq_streaming(freq=freq, sample_rate=args.sample_rate)
+        if radio._bit_depth != args.bit_depth:
+            print(f"NOTE: Requested {args.bit_depth}-bit, actual {radio._bit_depth}-bit at this rate")
 
         # Let it stabilize
         time.sleep(0.5)
@@ -63,13 +102,21 @@ def main():
         # Power
         power = np.mean(amplitude**2)
         power_db = 10 * np.log10(power + 1e-10)
-        print(f"\nPower: {power:.6f} ({power_db:.1f} dB)")
+        # Per-component RMS (I or Q) relative to full scale
+        rms_per_comp = np.sqrt(power / 2.0)
+        rms_dbfs = 20 * np.log10(rms_per_comp + 1e-10)
+        print(f"\nPower: {power:.6f} ({power_db:.1f} dBFS power)")
+        print(f"RMS per component: {rms_per_comp:.6f} ({rms_dbfs:.1f} dBFS)")
 
-        # Effective bits (assuming sine wave, 6.02 dB per bit)
-        # But we're normalized, so calculate from std relative to full scale
-        # Full scale normalized = 1.0, our std is what we have
+        # Effective bits (rough heuristic from amplitude std)
         effective_bits = np.log2(1.0 / (amplitude.std() + 1e-10))
         print(f"Effective dynamic range: ~{effective_bits:.1f} bits")
+        # Quantization SNR estimate (approx, per-component)
+        quant_snr_db = 6.02 * radio._bit_depth + 1.76 + rms_dbfs
+        print(f"Quantization SNR (est): {quant_snr_db:.1f} dB")
+        # Bits used based on RMS level relative to full scale
+        bits_used = max(0.0, radio._bit_depth + rms_dbfs / 6.02)
+        print(f"Bits used (from level): ~{bits_used:.1f}")
 
         # I/Q balance
         i_power = np.var(iq.real)
@@ -181,17 +228,26 @@ def main():
         print("\n" + "=" * 40)
         print("SUMMARY")
         print("=" * 40)
-        print(f"\nI/Q Level: {power_db:.1f} dB ({amplitude.mean()*100:.1f}% of full scale)")
+        print(f"\nI/Q Level: {power_db:.1f} dBFS power")
+        print(f"Bit depth: {radio._bit_depth}-bit")
+        print(f"I/Q RMS per component: {rms_dbfs:.1f} dBFS")
+        print(f"Mean |IQ|: {amplitude.mean()*100:.1f}% of full scale")
         print(f"Effective bits: ~{effective_bits:.0f}")
+        print(f"Bits used (from level): ~{bits_used:.0f}")
         print(f"FM Deviation: {fm_deviation/1000:.1f} kHz")
         print(f"Amplitude SNR: {amplitude_snr_db:.1f} dB")
+        print(f"Quantization SNR (est): {quant_snr_db:.1f} dB")
         if noise_power_scaled > 0:
             print(f"Spectral SNR: {spectral_snr_db:.1f} dB")
 
         if amplitude.mean() < 0.05:
-            print("\nWARNING: I/Q level is very low (<5% of full scale)")
-            print("This may limit demodulation quality due to quantization noise.")
-            print("Consider increasing iq_gain for better demodulation.")
+            print("\nNOTICE: I/Q mean level is low (<5% of full scale)")
+            if quant_snr_db < 50:
+                print("WARNING: Estimated quantization SNR is low and may limit demodulation quality.")
+            else:
+                print("Estimated quantization SNR looks adequate; low level may be OK.")
+            print("Note: iq_gain is post-ADC scaling and will not improve quantization noise.")
+            print("If needed, raise RF level (preamp/RF gain, reduce attenuation) or use 24-bit mode.")
 
     except Exception as e:
         print(f"\nError: {e}")
