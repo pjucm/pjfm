@@ -407,6 +407,7 @@ class AudioPlayer:
 
         # Adaptive rate control: target buffer level for rate adjustment
         self._target_level_ms = 100
+        self.overflow_samples = 0
 
     def _audio_callback(self, outdata, frames, time_info, status):
         """Sounddevice callback for audio output."""
@@ -441,6 +442,7 @@ class AudioPlayer:
     def start(self):
         """Start audio playback stream."""
         self.running = True
+        self.overflow_samples = 0
         # Pre-fill buffer to target level (accounts for first block adding more)
         prefill = int(self.sample_rate * self._target_level_ms / 1000)
         self.write_pos = prefill
@@ -506,11 +508,25 @@ class AudioPlayer:
         with self.buffer_lock:
             samples = len(audio_data)
             buffer_len = len(self.buffer)
-            space = buffer_len - ((self.write_pos - self.read_pos) % buffer_len) - 1
+            max_samples = buffer_len - 1
+            dropped = 0
 
+            if samples > max_samples:
+                # Keep only the newest samples if a single block exceeds capacity.
+                dropped += samples - max_samples
+                audio_data = audio_data[-max_samples:]
+                samples = max_samples
+
+            used = (self.write_pos - self.read_pos) % buffer_len
+            space = buffer_len - used - 1
             if samples > space:
-                # Buffer overflow - drop oldest data
-                samples = space
+                overflow = samples - space
+                # Drop oldest samples to make room for newest audio.
+                self.read_pos = (self.read_pos + overflow) % buffer_len
+                dropped += overflow
+
+            if dropped:
+                self.overflow_samples += dropped
 
             if samples > 0:
                 end_pos = self.write_pos + samples
@@ -1572,6 +1588,10 @@ def build_display(radio, width=80):
         buf_error = rc_stats['current_ms'] - rc_stats['target_ms']
         rate_ppm = -buf_error * 10  # 10 ppm per ms error
         buf_text.append(f"  adj:{rate_ppm:+.0f}ppm", style="green bold")
+        drop_samples = radio.audio_player.overflow_samples
+        if drop_samples:
+            drop_ms = drop_samples / radio.audio_player.sample_rate * 1000
+            buf_text.append(f"  drop:{drop_ms:.0f}ms", style="red bold")
 
         table.add_row("Buffer:", buf_text)
 
