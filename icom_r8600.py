@@ -320,6 +320,9 @@ class IcomR8600:
         self._fetch_slow_multiplier = 2.0  # Slow threshold = max(min_threshold, expected_ms * multiplier)
         self._civ_timeouts = 0  # Count of CI-V response timeouts
         self._buffer_overflow_count = 0  # Count of buffer overflow events
+        self._civ_lock = threading.Lock()
+        self._civ_flush_reads = 4
+        self._civ_flush_timeout_ms = 5
         self._iq_lock = threading.Lock()
         self._iq_thread = None
         self._running = False
@@ -403,10 +406,18 @@ class IcomR8600:
         if self.device:
             try:
                 # Disable I/Q output first, with delay for processing
-                self._send_command(_build_civ_command([0x1A, 0x13, 0x01, 0x00]), timeout=1000)
+                self._send_command(
+                    _build_civ_command([0x1A, 0x13, 0x01, 0x00]),
+                    timeout=250,
+                    expect_response=False
+                )
                 time.sleep(0.2)
                 # Disable I/Q mode (turn off REMOTE LED)
-                self._send_command(_build_civ_command([0x1A, 0x13, 0x00, 0x00]), timeout=1000)
+                self._send_command(
+                    _build_civ_command([0x1A, 0x13, 0x00, 0x00]),
+                    timeout=250,
+                    expect_response=False
+                )
                 time.sleep(0.2)
             except (usb.core.USBError, RuntimeError):
                 pass
@@ -422,21 +433,42 @@ class IcomR8600:
                 pass
             self.device = None
 
-    def _send_command(self, cmd_bytes, timeout=2000):
-        """Send CI-V command and return response."""
-        try:
-            self.device.write(EP_CMD_OUT, cmd_bytes, timeout=timeout)
-        except usb.core.USBError as e:
-            raise RuntimeError(f"Failed to send command: {e}")
+    def _flush_civ_responses(self, max_reads=None, timeout_ms=None):
+        """Drain any pending CI-V responses to avoid stale reads."""
+        if max_reads is None:
+            max_reads = self._civ_flush_reads
+        if timeout_ms is None:
+            timeout_ms = self._civ_flush_timeout_ms
 
-        try:
-            response = self.device.read(EP_RESP_IN, 64, timeout=timeout)
-            return bytes(response)
-        except usb.core.USBTimeoutError:
-            self._civ_timeouts += 1
-            return None
-        except usb.core.USBError as e:
-            raise RuntimeError(f"Failed to read response: {e}")
+        for _ in range(max_reads):
+            try:
+                self.device.read(EP_RESP_IN, 64, timeout=timeout_ms)
+            except usb.core.USBTimeoutError:
+                break
+            except usb.core.USBError:
+                break
+
+    def _send_command(self, cmd_bytes, timeout=2000, expect_response=True, flush=True):
+        """Send CI-V command and return response (or None)."""
+        with self._civ_lock:
+            if flush:
+                self._flush_civ_responses()
+            try:
+                self.device.write(EP_CMD_OUT, cmd_bytes, timeout=timeout)
+            except usb.core.USBError as e:
+                raise RuntimeError(f"Failed to send command: {e}")
+
+            if not expect_response:
+                return None
+
+            try:
+                response = self.device.read(EP_RESP_IN, 64, timeout=timeout)
+                return bytes(response)
+            except usb.core.USBTimeoutError:
+                self._civ_timeouts += 1
+                return None
+            except usb.core.USBError as e:
+                raise RuntimeError(f"Failed to read response: {e}")
 
     def configure_iq_streaming(self, freq=None, sample_rate=250000):
         """
@@ -475,27 +507,45 @@ class IcomR8600:
         # First, ensure clean state by disabling any existing I/Q output
         # These may timeout if already disabled - that's OK
         try:
-            self._send_command(_build_civ_command([0x1A, 0x13, 0x01, 0x00]), timeout=500)
+            self._send_command(
+                _build_civ_command([0x1A, 0x13, 0x01, 0x00]),
+                timeout=250,
+                expect_response=False
+            )
         except RuntimeError:
             pass
         time.sleep(0.1)
 
         # Enable I/Q mode (REMOTE LED on)
-        resp = self._send_command(_build_civ_command([0x1A, 0x13, 0x00, 0x01]))
+        resp = self._send_command(
+            _build_civ_command([0x1A, 0x13, 0x00, 0x01]),
+            timeout=500
+        )
         if resp and CIV_NG in resp:
             raise RuntimeError("Failed to enable I/Q mode")
 
         # Set frequency
         bcd_freq = _freq_to_bcd(self.frequency)
-        resp = self._send_command(_build_civ_command([0x05] + list(bcd_freq)))
+        resp = self._send_command(
+            _build_civ_command([0x05] + list(bcd_freq)),
+            timeout=500
+        )
         if resp and CIV_NG in resp:
             raise RuntimeError("Failed to set frequency")
 
         # Set optimal RF settings for I/Q streaming (per HDSDR capture)
         # These settings revert when exiting I/Q mode (per Icom I/Q Reference Guide p.13)
         # ATT=0dB and RF Gain=255 for maximum sensitivity
-        self._send_command(_build_civ_command([0x11, 0x00]))  # Attenuator OFF
-        self._send_command(_build_civ_command([0x14, 0x02, 0x02, 0x55]))  # RF Gain 255 (BCD: 0255)
+        self._send_command(
+            _build_civ_command([0x11, 0x00]),
+            timeout=200,
+            expect_response=False
+        )  # Attenuator OFF
+        self._send_command(
+            _build_civ_command([0x14, 0x02, 0x02, 0x55]),
+            timeout=200,
+            expect_response=False
+        )  # RF Gain 255 (BCD: 0255)
 
         # Query and display current RF settings
         rf_settings = self.query_rf_settings()
@@ -506,10 +556,17 @@ class IcomR8600:
 
         # Enable HF BPF (for HF frequencies)
         if self.frequency < 30e6:
-            self._send_command(_build_civ_command([0x1A, 0x13, 0x02, 0x01]))
+            self._send_command(
+                _build_civ_command([0x1A, 0x13, 0x02, 0x01]),
+                timeout=200,
+                expect_response=False
+            )
 
         # Enable I/Q output with chosen sample rate
-        resp = self._send_command(_build_civ_command([0x1A, 0x13, 0x01, 0x01, bit_depth, rate_code]))
+        resp = self._send_command(
+            _build_civ_command([0x1A, 0x13, 0x01, 0x01, bit_depth, rate_code]),
+            timeout=500
+        )
         if resp and CIV_NG in resp:
             raise RuntimeError("Failed to enable I/Q output")
 
@@ -1133,7 +1190,10 @@ class IcomR8600:
         settings = {}
 
         # Query RF gain (14 02) - response includes 2-byte BCD value
-        resp = self._send_command(_build_civ_command([0x14, 0x02]))
+        resp = self._send_command(
+            _build_civ_command([0x14, 0x02]),
+            timeout=200
+        )
         if resp and len(resp) >= 8 and CIV_OK not in resp:
             # Response format: FE FE E0 96 14 02 XX XX FD
             # XX XX is BCD value 0000-0255
@@ -1148,7 +1208,10 @@ class IcomR8600:
                 pass
 
         # Query attenuator (11) - response includes setting byte
-        resp = self._send_command(_build_civ_command([0x11]))
+        resp = self._send_command(
+            _build_civ_command([0x11]),
+            timeout=200
+        )
         if resp and len(resp) >= 6:
             try:
                 idx = resp.index(0x11)
@@ -1160,7 +1223,10 @@ class IcomR8600:
                 pass
 
         # Query preamp (16 02)
-        resp = self._send_command(_build_civ_command([0x16, 0x02]))
+        resp = self._send_command(
+            _build_civ_command([0x16, 0x02]),
+            timeout=200
+        )
         if resp and len(resp) >= 7:
             try:
                 idx = resp.index(0x16)
@@ -1170,7 +1236,10 @@ class IcomR8600:
                 pass
 
         # Query IP+ (16 65)
-        resp = self._send_command(_build_civ_command([0x16, 0x65]))
+        resp = self._send_command(
+            _build_civ_command([0x16, 0x65]),
+            timeout=200
+        )
         if resp and len(resp) >= 7:
             try:
                 idx = resp.index(0x16)
