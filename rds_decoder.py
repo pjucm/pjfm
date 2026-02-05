@@ -2,14 +2,12 @@
 """
 RDS (Radio Data System) Decoder for FM Broadcasts
 
-Supports two demodulation methods:
-1. Coherent demodulation (default): Uses 19 kHz pilot to derive 57 kHz carrier
-   via tripling (cos(3θ) = 4cos³(θ) - 3cos(θ)), then differential decoding.
-2. Delay-and-multiply (fallback): Non-coherent detection when pilot unavailable.
+Uses coherent demodulation: extracts 19 kHz pilot and triples to 57 kHz carrier
+via the identity cos(3θ) = 4cos³(θ) - 3cos(θ), then performs differential decoding.
 
 Signal processing chain:
 - Bandpass filtering at 57 kHz to extract RDS subcarrier
-- BPSK demodulation (coherent or delay-and-multiply)
+- Coherent BPSK demodulation using pilot-derived carrier
 - Differential decoding (RDS uses differential encoding)
 - Symbol timing recovery via Gardner TED
 - Syndrome-based block synchronization
@@ -221,7 +219,7 @@ class RDSDecoder:
 
     def __init__(self, sample_rate=250000, matched_filter=False, matched_filter_len=None,
                  timing_gain_p=None, timing_gain_i=None, lpf_cutoff=None,
-                 bpf_bandwidth=None, agc_alpha=None, soft_decision_alpha=None):
+                 bpf_bandwidth=None, agc_alpha=None):
         """
         Initialize RDS decoder.
 
@@ -229,20 +227,18 @@ class RDSDecoder:
             sample_rate: Sample rate of input baseband signal in Hz
             matched_filter: If True, use an FIR low-pass matched-style filter
                             instead of the IIR low-pass after demodulation.
-            matched_filter_len: Override FIR tap count (default: 129)
+            matched_filter_len: Override FIR tap count (default: 101)
             timing_gain_p: Proportional gain for timing recovery (default: 0.015)
             timing_gain_i: Integral gain for timing recovery (default: 0.0008)
             lpf_cutoff: Post-demod LPF cutoff in Hz (default: 800)
             bpf_bandwidth: RDS BPF half-bandwidth in Hz (default: 2000)
             agc_alpha: AGC tracking speed, 0-1 (default: 0.05, slower=more stable)
-            soft_decision_alpha: Soft decision smoothing, 0=off (default: 0, disabled
-                because it causes ISI with differential BPSK)
         """
         self.sample_rate = sample_rate
         self.samples_per_symbol = sample_rate / RDS_SYMBOL_RATE
 
-        # Delay in samples for delay-and-multiply (one symbol period)
-        self.delay_samples = int(round(self.samples_per_symbol))
+        # Delay in samples for differential decoding (one symbol period)
+        self._diff_delay = int(round(self.samples_per_symbol))
 
         nyq = sample_rate / 2
 
@@ -266,9 +262,6 @@ class RDSDecoder:
         self._lpf_cutoff = lpf_freq
         self.lpf_b, self.lpf_a = signal.butter(2, lpf_freq / nyq, btype='low')
         self.lpf_zi = signal.lfilter_zi(self.lpf_b, self.lpf_a) * 0
-
-        # Delay line for delay-and-multiply
-        self.delay_buffer = np.zeros(self.delay_samples)
 
         # Optional FIR low-pass (matched-style) filter
         self.matched_filter = matched_filter
@@ -295,8 +288,8 @@ class RDSDecoder:
         self.pilot_bpf_a = 1.0
         self.pilot_bpf_zi = signal.lfilter_zi(self.pilot_bpf_b, self.pilot_bpf_a) * 0
 
-        # Delay buffer for differential decoding in coherent mode
-        self._coherent_delay_buf = np.zeros(self.delay_samples)
+        # Delay buffer for differential decoding
+        self._diff_delay_buf = np.zeros(self._diff_delay)
 
         # Symbol timing recovery state (Gardner TED with PI loop)
         # Default gains reduced from 0.03/0.003 for better low-SNR stability
@@ -310,11 +303,6 @@ class RDSDecoder:
         # AGC parameters - slow tracking for noise immunity
         self._agc_alpha = agc_alpha if agc_alpha is not None else 0.05
         self._agc_rms = 0.1  # Initial AGC estimate
-
-        # Soft decision smoothing (0 = disabled)
-        # NOTE: Disabled by default because it causes ISI with differential BPSK
-        self._soft_decision_alpha = soft_decision_alpha if soft_decision_alpha is not None else 0.0
-        self._soft_accum = 0.0  # Accumulator for soft decisions
 
         # Bit buffer and block sync state
         self.bit_buffer = []
@@ -592,8 +580,7 @@ class RDSDecoder:
 
         Args:
             baseband: FM-demodulated baseband signal at sample_rate
-            use_coherent: If not None, use coherent demodulation (extracts
-                         pilot from baseband). If None, use delay-and-multiply.
+            use_coherent: Deprecated, ignored. Coherent demod always used.
 
         Returns:
             Dictionary containing decoded RDS data and status
@@ -612,11 +599,8 @@ class RDSDecoder:
         rds_power = np.sqrt(np.mean(rds_signal ** 2))
         self.rds_signal_level = 0.9 * self.rds_signal_level + 0.1 * rds_power
 
-        # Demodulate BPSK
-        if use_coherent:
-            bpsk_baseband = self._coherent_demod(rds_signal, baseband)
-        else:
-            bpsk_baseband = self._delay_multiply_demod(rds_signal)
+        # Coherent BPSK demodulation using pilot-derived carrier
+        bpsk_baseband = self._coherent_demod(rds_signal, baseband)
 
         # AGC - normalize signal amplitude for consistent symbol decisions
         # Use slow-tracking AGC to avoid noise modulation at low SNR
@@ -675,7 +659,8 @@ class RDSDecoder:
         # Normalize pilot to unit amplitude for tripling formula
         pilot_rms = np.sqrt(np.mean(pilot ** 2))
         if pilot_rms < 1e-10:
-            return self._delay_multiply_demod(rds_signal)
+            # No pilot detected - return zeros (RDS requires pilot for coherent demod)
+            return np.zeros(len(rds_signal))
 
         # Diagnostics: track pilot quality
         if self._diag_enabled:
@@ -700,20 +685,20 @@ class RDSDecoder:
 
         # Differential decoding: multiply by one-symbol-delayed version
         n = len(coherent_product)
-        delay = self.delay_samples
+        delay = self._diff_delay
 
         delayed = np.zeros(n)
         if n >= delay:
-            delayed[:delay] = self._coherent_delay_buf
+            delayed[:delay] = self._diff_delay_buf
             delayed[delay:] = coherent_product[:n - delay]
         else:
-            delayed[:n] = self._coherent_delay_buf[:n]
+            delayed[:n] = self._diff_delay_buf[:n]
 
         if n >= delay:
-            self._coherent_delay_buf = coherent_product[-delay:].copy()
+            self._diff_delay_buf = coherent_product[-delay:].copy()
         else:
-            self._coherent_delay_buf[:-n] = self._coherent_delay_buf[n:]
-            self._coherent_delay_buf[-n:] = coherent_product
+            self._diff_delay_buf[:-n] = self._diff_delay_buf[n:]
+            self._diff_delay_buf[-n:] = coherent_product
 
         diff_decoded = coherent_product * delayed
 
@@ -731,38 +716,6 @@ class RDSDecoder:
         if self._diag_enabled:
             bb_rms = np.sqrt(np.mean(bpsk_baseband ** 2))
             self._baseband_rms_pre_agc = 0.9 * self._baseband_rms_pre_agc + 0.1 * bb_rms
-
-        return bpsk_baseband
-
-    def _delay_multiply_demod(self, rds_signal):
-        """
-        Delay-and-multiply demodulation (fallback when no pilot).
-        """
-        n = len(rds_signal)
-
-        # Create delayed version using delay buffer for continuity
-        delayed = np.zeros(n)
-
-        if n >= self.delay_samples:
-            delayed[:self.delay_samples] = self.delay_buffer
-            delayed[self.delay_samples:] = rds_signal[:n - self.delay_samples]
-        else:
-            delayed[:n] = self.delay_buffer[:n]
-
-        # Update delay buffer
-        if n >= self.delay_samples:
-            self.delay_buffer = rds_signal[-self.delay_samples:].copy()
-        else:
-            self.delay_buffer[:-n] = self.delay_buffer[n:]
-            self.delay_buffer[-n:] = rds_signal
-
-        # Multiply signal by delayed version
-        multiplied = rds_signal * delayed
-
-        # Low-pass filter to remove 114 kHz and extract baseband
-        bpsk_baseband, self.lpf_zi = signal.lfilter(
-            self.lpf_b, self.lpf_a, multiplied, zi=self.lpf_zi
-        )
 
         return bpsk_baseband
 
@@ -805,15 +758,8 @@ class RDSDecoder:
             mid_sample = interp(pos_mid)
             next_sample = interp(pos_next)
 
-            # Symbol decision with optional soft averaging for low-SNR improvement
-            if self._soft_decision_alpha > 0:
-                # Soft decision: exponential smoothing reduces noise-induced bit errors
-                self._soft_accum = (self._soft_decision_alpha * next_sample +
-                                    (1.0 - self._soft_decision_alpha) * self._soft_accum)
-                data_bit = 0 if self._soft_accum > 0 else 1
-            else:
-                # Hard decision (original behavior)
-                data_bit = 0 if next_sample > 0 else 1
+            # Hard decision symbol detection
+            data_bit = 0 if next_sample > 0 else 1
             self.bit_distribution[data_bit] += 1
 
             # Diagnostics: capture soft symbol value for constellation analysis
@@ -1232,9 +1178,8 @@ class RDSDecoder:
         if self.matched_filter:
             self.mf_zi = signal.lfilter_zi(self.mf_b, self.mf_a) * 0
 
-        # Delay buffers
-        self.delay_buffer = np.zeros(self.delay_samples)
-        self._coherent_delay_buf = np.zeros(self.delay_samples)
+        # Delay buffer for differential decoding
+        self._diff_delay_buf = np.zeros(self._diff_delay)
 
         # Timing recovery
         self.timing_mu = 0.5
@@ -1281,9 +1226,8 @@ class RDSDecoder:
         self.last_syndromes = []
         self.bit_distribution = [0, 0]
 
-        # AGC and soft decision state
+        # AGC state
         self._agc_rms = 0.1
-        self._soft_accum = 0.0
 
         # Diagnostics
         self._diag_buffer.clear()

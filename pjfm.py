@@ -619,7 +619,6 @@ class FMRadio:
         self.rds_decoder = None
         self.rds_enabled = False
         self.rds_data = {}
-        self.rds_use_coherent = False
         self.rds_forced_off = False
 
         # Auto RDS mode (enabled by default, disable with --no-rds)
@@ -1102,8 +1101,7 @@ class FMRadio:
                         self.rds_decoder and
                         self.stereo_decoder.last_baseband is not None):
                     self.rds_data = self.rds_decoder.process(
-                        self.stereo_decoder.last_baseband,
-                        use_coherent=self.rds_use_coherent  # Pilot-derived carrier or delay-multiply
+                        self.stereo_decoder.last_baseband
                     )
 
                 # Apply squelch (mute if signal below threshold)
@@ -1290,13 +1288,6 @@ class FMRadio:
         if self.rds_forced_off:
             return
         self.rds_enabled = not self.rds_enabled
-        if self.rds_decoder:
-            self.rds_decoder.reset()
-        self.rds_data = {}
-
-    def toggle_rds_coherent(self):
-        """Toggle coherent vs delay-multiply RDS demodulation (hidden debug feature)."""
-        self.rds_use_coherent = not self.rds_use_coherent
         if self.rds_decoder:
             self.rds_decoder.reset()
         self.rds_data = {}
@@ -1889,7 +1880,6 @@ def build_display(radio, width=80):
             carrier_rms = rds_snapshot.get('carrier_rms', 0)
             bb_rms = rds_snapshot.get('baseband_rms', 0)
             symbol_snr = rds_snapshot.get('symbol_snr_db', 0)
-            demod_mode = "coh" if radio.rds_use_coherent else "dly"
             # Color symbol SNR based on quality
             if symbol_snr >= 15:
                 snr_style = "green bold"
@@ -1899,7 +1889,6 @@ def build_display(radio, width=80):
                 snr_style = "yellow"
             else:
                 snr_style = "red"
-            rds_diag.append(f"mode:{demod_mode} ", style="dim")
             rds_diag.append(f"pilot:{pilot_rms:.4f} ", style="dim")
             rds_diag.append(f"carrier:{carrier_rms:.3f} ", style="dim")
             rds_diag.append(f"bb:{bb_rms:.4f} ", style="dim")
@@ -2210,11 +2199,6 @@ def run_rich_ui(radio):
                     elif input_buffer[0] == '/':
                         # Toggle buffer stats (hidden debug feature)
                         radio.toggle_buffer_stats()
-                        input_buffer = input_buffer[1:]
-                    elif input_buffer[0] == 'c':
-                        # Toggle coherent RDS demod (hidden debug feature)
-                        if not radio.weather_mode:
-                            radio.toggle_rds_coherent()
                         input_buffer = input_buffer[1:]
                     elif input_buffer[0] == 'P':
                         # Toggle demod profiling (hidden debug feature)
