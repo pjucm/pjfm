@@ -60,7 +60,7 @@ except ImportError:
 
 try:
     from bb60d import BB60D, get_api_version as bb60d_get_api_version
-except ImportError as e:
+except (ImportError, RuntimeError):
     BB60D = None
     bb60d_get_api_version = None
 
@@ -97,7 +97,7 @@ def enable_realtime_mode():
         'errors': []
     }
 
-    # Try to set SCHED_FIFO with priority 50 (range is 1-99)
+    # Try to set SCHED_FIFO with priority 50 (range is 1-99, Linux only)
     try:
         priority = 50
         param = os.sched_param(priority)
@@ -106,6 +106,8 @@ def enable_realtime_mode():
         results['priority'] = priority
     except PermissionError:
         results['errors'].append("SCHED_FIFO: Permission denied (need root or CAP_SYS_NICE)")
+    except AttributeError:
+        results['errors'].append("SCHED_FIFO: Not available on this platform")
     except Exception as e:
         results['errors'].append(f"SCHED_FIFO: {e}")
 
@@ -882,11 +884,11 @@ class FMRadio:
 
     def _audio_loop(self):
         """Background thread for IQ capture, demodulation, and signal measurement."""
-        # Set SCHED_FIFO for this DSP thread
+        # Set SCHED_FIFO for this DSP thread (Linux only)
         try:
             param = os.sched_param(50)
             os.sched_setscheduler(0, os.SCHED_FIFO, param)
-        except (PermissionError, OSError):
+        except (PermissionError, OSError, AttributeError):
             pass  # Silently fall back to normal scheduling
 
         # PI rate control with error filtering for audio buffer management

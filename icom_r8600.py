@@ -597,11 +597,11 @@ class IcomR8600:
 
     def _iq_reader_loop(self):
         """Background thread to continuously read I/Q data from USB."""
-        # Set SCHED_FIFO for this I/Q reader thread
+        # Set SCHED_FIFO for this I/Q reader thread (Linux only)
         try:
             param = os.sched_param(50)
             os.sched_setscheduler(0, os.SCHED_FIFO, param)
-        except (PermissionError, OSError):
+        except (PermissionError, OSError, AttributeError):
             pass  # Silently fall back to normal scheduling
 
         # Fixed read size for USB efficiency
