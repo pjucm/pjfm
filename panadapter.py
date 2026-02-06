@@ -1494,7 +1494,7 @@ class MainWindow(QMainWindow):
         demod_layout.addWidget(self.stereo_label)
         self.stereo_indicator = QLabel('MONO')
         self.stereo_indicator.setMinimumWidth(60)
-        self.stereo_indicator.setStyleSheet('font-family: "Menlo", monospace; color: black;')
+        self.stereo_indicator.setStyleSheet('font-family: "Menlo", monospace; color: white;')
         demod_layout.addWidget(self.stereo_indicator)
 
         # SNR indicator (fixed width to prevent layout jumping)
@@ -1502,7 +1502,7 @@ class MainWindow(QMainWindow):
         demod_layout.addWidget(self.snr_label)
         self.snr_indicator = QLabel('-- dB')
         self.snr_indicator.setFixedWidth(90)
-        self.snr_indicator.setStyleSheet('font-family: "Menlo", monospace; color: black;')
+        self.snr_indicator.setStyleSheet('font-family: "Menlo", monospace; color: white;')
         demod_layout.addWidget(self.snr_indicator)
 
         # Initially hide stereo/SNR indicators (only show in FM Broadcast mode)
@@ -1849,12 +1849,12 @@ class MainWindow(QMainWindow):
                 self.stereo_indicator.setText(f'{blend_pct}%')
         else:
             self.stereo_indicator.setText('MONO')
-        self.stereo_indicator.setStyleSheet('font-family: "Menlo", monospace; color: black;')
+        self.stereo_indicator.setStyleSheet('font-family: "Menlo", monospace; color: white;')
 
         # Update SNR indicator
         snr = self.wbfm_demodulator.snr_db
         self.snr_indicator.setText(f'{snr:2.0f} dB')
-        self.snr_indicator.setStyleSheet('font-family: "Menlo", monospace; color: black;')
+        self.snr_indicator.setStyleSheet('font-family: "Menlo", monospace; color: white;')
 
     def _update_peak_meter(self):
         """Update peak meter with audio peak level from demodulator."""
