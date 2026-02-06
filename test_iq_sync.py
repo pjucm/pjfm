@@ -41,14 +41,34 @@ SAMPLE_SIZE_16BIT = 4  # 2 bytes I + 2 bytes Q
 SAMPLE_SIZE_24BIT = 6  # 3 bytes I + 3 bytes Q
 
 
-def find_all_sync_positions(data: bytes, sync_pattern: bytes) -> list[int]:
-    """Find all positions of the sync pattern in data."""
+def find_all_sync_positions(data: bytes, sync_pattern: bytes,
+                            expected_gap: int = 0) -> list[int]:
+    """Find all positions of the sync pattern in data.
+
+    If expected_gap > 0, each candidate is validated by checking that another
+    sync pattern exists exactly expected_gap bytes later (matching the driver's
+    double-sync validation).  This rejects false positives where real I/Q sample
+    data happens to contain the sync byte sequence.
+    """
+    sync_len = len(sync_pattern)
     positions = []
     pos = 0
     while True:
         idx = data.find(sync_pattern, pos)
         if idx == -1:
             break
+        if expected_gap > 0:
+            next_pos = idx + sync_len + expected_gap
+            if next_pos + sync_len <= len(data):
+                if data[next_pos:next_pos + sync_len] != sync_pattern:
+                    pos = idx + 1
+                    continue
+            else:
+                # Not enough data to verify — accept if prior validated sync
+                # is at the expected distance behind us
+                if positions and idx - positions[-1] != sync_len + expected_gap:
+                    pos = idx + 1
+                    continue
         positions.append(idx)
         pos = idx + 1
     return positions
@@ -264,7 +284,9 @@ def run_test(sample_rate: int, use_24bit: bool, freq_hz: int, duration: float) -
         print("\nSYNC PATTERN ANALYSIS")
         print("-" * 40)
 
-        positions = find_all_sync_positions(raw_data, sync_pattern)
+        sync_interval = SYNC_INTERVAL.get(sample_rate, 1024)
+        expected_gap = sync_interval * sample_size  # bytes of I/Q data between syncs
+        positions = find_all_sync_positions(raw_data, sync_pattern, expected_gap)
         print(f"Found {len(positions)} sync patterns")
 
         if len(positions) < 2:
@@ -350,9 +372,10 @@ Supported sample rates:
   24-bit: {', '.join(f'{r/1e3:.0f}k' for r in rates_24bit)}
 
 Examples:
-  ./test_iq_sync.py --16bit --rate 960000
-  ./test_iq_sync.py --24bit --rate 480000
-  ./test_iq_sync.py --all  # Test all combinations
+  ./test_iq_sync.py 1920/16 3840/24  # Test specific rate/bit-depth combos
+  ./test_iq_sync.py 960/16            # Single test
+  ./test_iq_sync.py --all             # Test all combinations
+  ./test_iq_sync.py --16bit --rate 960000  # Explicit form
 """)
     parser.add_argument("--duration", type=float, default=5.0,
                         help="Duration to stream in seconds (default: 5)")
@@ -370,9 +393,51 @@ Examples:
 
     parser.add_argument("--rate", type=int, default=480000,
                         help="Sample rate in Hz (default: 480000)")
+    parser.add_argument("tests", nargs="*", metavar="RATE/BITS",
+                        help="Rate/bit-depth combos, e.g. 1920/16 3840/24 (rate in kHz)")
     args = parser.parse_args()
 
     freq_hz = int(args.freq * 1e6)
+
+    # Positional rate/bits arguments
+    if args.tests:
+        results = []
+        for spec in args.tests:
+            try:
+                rate_str, bits_str = spec.split("/")
+                rate = int(rate_str.rstrip("k")) * 1000
+                use_24bit = bits_str in ("24", "24bit")
+                if not use_24bit and bits_str not in ("16", "16bit"):
+                    print(f"Error: invalid bit depth '{bits_str}' in '{spec}' (use 16 or 24)")
+                    return 1
+                valid_rates = SAMPLE_RATES_24BIT if use_24bit else SAMPLE_RATES
+                if rate not in valid_rates:
+                    bit_str = "24-bit" if use_24bit else "16-bit"
+                    print(f"Error: rate {rate} not available for {bit_str} mode")
+                    print(f"Available: {sorted(valid_rates.keys())}")
+                    return 1
+            except ValueError:
+                print(f"Error: invalid test spec '{spec}' (expected RATE/BITS, e.g. 1920/16)")
+                return 1
+            passed = run_test(rate, use_24bit, freq_hz, args.duration)
+            results.append((rate, f"{'24' if use_24bit else '16'}-bit", passed))
+            if spec != args.tests[-1]:
+                time.sleep(1.0)
+
+        if len(results) > 1:
+            print("\n" + "="*60)
+            print("SUMMARY")
+            print("="*60)
+            print(f"\n{'Rate':>12}  {'Bits':>8}  {'Result':>10}")
+            print("-" * 35)
+            for rate, bits, passed in results:
+                status = "PASS" if passed else "FAIL"
+                print(f"{rate/1e3:>10.0f}k  {bits:>8}  {status:>10}")
+            passed_count = sum(1 for _, _, p in results if p)
+            print("-" * 35)
+            print(f"Total: {passed_count}/{len(results)} passed")
+
+        return 0 if all(p for _, _, p in results) else 1
 
     # Test all combinations
     if args.test_all:

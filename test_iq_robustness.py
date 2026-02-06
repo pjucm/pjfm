@@ -8,8 +8,10 @@ in the fetch_iq() implementation.
 
 Usage:
     python test_iq_robustness.py          # Run all tests (requires hardware)
-    pytest test_iq_robustness.py -v       # Run with pytest
     python test_iq_robustness.py --sim    # Run simulation tests only (no hardware)
+    python test_iq_robustness.py 1920/16 3840/24          # Test specific combos
+    python test_iq_robustness.py 1920/16 3840/24 --sync   # Sync tests only
+    python test_iq_robustness.py 960/24 --duration        # Duration test only
 
 Tests:
     1. Sync interval consistency across all sample rates
@@ -456,18 +458,19 @@ def test_buffer_growth_simulation():
 # Hardware Tests (Requires IC-R8600)
 # =============================================================================
 
-def test_hardware_sync_all_rates(use_24bit=False):
+def test_hardware_sync_all_rates(use_24bit=False, rates=None):
     """
-    Test sync pattern consistency at all sample rates.
+    Test sync pattern consistency at all (or specified) sample rates.
 
     Requires IC-R8600 connected.
 
     Args:
         use_24bit: If True, test 24-bit mode; otherwise test 16-bit mode.
+        rates: Optional list of specific sample rates to test. If None, tests all.
     """
     bit_label = "24-bit" if use_24bit else "16-bit"
     print("\n" + "=" * 70)
-    print(f"Test: Hardware Sync Pattern Verification (All Rates, {bit_label})")
+    print(f"Test: Hardware Sync Pattern Verification ({bit_label})")
     print("=" * 70)
 
     try:
@@ -485,10 +488,9 @@ def test_hardware_sync_all_rates(use_24bit=False):
 
     results = []
 
-    # Test all supported sample rates for each bit depth
-    # 16-bit: 240k, 480k, 960k, 1920k, 3840k, 5120k (5120k is 16-bit only)
-    # 24-bit: 240k, 480k, 960k, 1920k, 3840k
-    if use_24bit:
+    if rates:
+        sample_rates = sorted(rates)
+    elif use_24bit:
         sample_rates = [240000, 480000, 960000, 1920000, 3840000]
     else:
         sample_rates = [240000, 480000, 960000, 1920000, 3840000, 5120000]
@@ -557,7 +559,7 @@ def test_hardware_sync_all_rates(use_24bit=False):
     return all_pass
 
 
-def test_hardware_long_duration(use_24bit=False):
+def test_hardware_long_duration(use_24bit=False, sample_rate=None):
     """
     Test long-duration streaming stability.
 
@@ -566,10 +568,14 @@ def test_hardware_long_duration(use_24bit=False):
 
     Args:
         use_24bit: If True, test 24-bit mode; otherwise test 16-bit mode.
+        sample_rate: Specific sample rate to test. If None, uses default.
     """
+    if sample_rate is None:
+        sample_rate = 1920000 if use_24bit else 480000
+
     bit_label = "24-bit" if use_24bit else "16-bit"
     print("\n" + "=" * 70)
-    print(f"Test: Long Duration Streaming (60 seconds, {bit_label})")
+    print(f"Test: Long Duration Streaming (60s, {sample_rate/1000:.0f} kHz, {bit_label})")
     print("=" * 70)
 
     try:
@@ -577,9 +583,6 @@ def test_hardware_long_duration(use_24bit=False):
     except ImportError as e:
         print(f"\n  SKIP: Cannot import IcomR8600: {e}")
         return True
-
-    # Use appropriate sample rate for bit depth
-    sample_rate = 1920000 if use_24bit else 480000
 
     try:
         radio = IcomR8600(use_24bit=use_24bit)
@@ -737,16 +740,45 @@ def run_simulation_tests():
     return results
 
 
-def run_hardware_tests(use_24bit=None, test_filter=None):
+def run_hardware_tests(use_24bit=None, test_filter=None, rate_specs=None):
     """Run tests that require IC-R8600 hardware.
 
     Args:
         use_24bit: None=both, True=24-bit only, False=16-bit only
         test_filter: None=all, 'sync'=sync tests only, 'duration'=duration tests only
+        rate_specs: Optional list of (rate, use_24bit) tuples for specific combos
     """
     tests = []
 
-    # Build test list based on filters
+    # If specific rate/bits combos were given, build targeted tests
+    if rate_specs:
+        run_sync = test_filter is None or test_filter == 'sync'
+        run_duration = test_filter is None or test_filter == 'duration'
+
+        # Group rates by bit depth for sync tests
+        rates_16 = [r for r, is24 in rate_specs if not is24]
+        rates_24 = [r for r, is24 in rate_specs if is24]
+
+        if run_sync:
+            if rates_16:
+                label = ', '.join(f'{r/1000:.0f}k' for r in sorted(rates_16))
+                tests.append((f"Hardware Sync ({label}, 16-bit)",
+                             lambda r=rates_16: test_hardware_sync_all_rates(use_24bit=False, rates=r)))
+            if rates_24:
+                label = ', '.join(f'{r/1000:.0f}k' for r in sorted(rates_24))
+                tests.append((f"Hardware Sync ({label}, 24-bit)",
+                             lambda r=rates_24: test_hardware_sync_all_rates(use_24bit=True, rates=r)))
+
+        if run_duration:
+            for rate, is24 in rate_specs:
+                bit_str = "24-bit" if is24 else "16-bit"
+                tests.append((f"Hardware Long Duration ({rate/1000:.0f}k, {bit_str})",
+                             lambda r=rate, b=is24: test_hardware_long_duration(use_24bit=b, sample_rate=r)))
+
+        tests.append(("Hardware Diagnostics API", test_hardware_diagnostics_api))
+        return _run_test_list(tests)
+
+    # Original behavior: run by bit-depth and test-type filters
     run_16bit = use_24bit is None or use_24bit is False
     run_24bit = use_24bit is None or use_24bit is True
     run_sync = test_filter is None or test_filter == 'sync'
@@ -772,6 +804,11 @@ def run_hardware_tests(use_24bit=None, test_filter=None):
     if run_diag:
         tests.append(("Hardware Diagnostics API", test_hardware_diagnostics_api))
 
+    return _run_test_list(tests)
+
+
+def _run_test_list(tests):
+    """Run a list of (name, callable) test pairs and return results."""
     results = []
     for name, test_func in tests:
         try:
@@ -800,6 +837,8 @@ def main():
                         help="Run sync pattern tests only")
     parser.add_argument("--duration", action="store_true",
                         help="Run long duration tests only")
+    parser.add_argument("tests", nargs="*", metavar="RATE/BITS",
+                        help="Rate/bit-depth combos, e.g. 1920/16 3840/24 (rate in kHz)")
     args = parser.parse_args()
 
     print("\n" + "=" * 70)
@@ -808,37 +847,74 @@ def main():
 
     results = []
 
-    # Determine bit depth filter
-    if args.use_16bit and args.use_24bit:
-        bit_filter = None  # Both
-    elif args.use_16bit:
-        bit_filter = False  # 16-bit only
-    elif args.use_24bit:
-        bit_filter = True   # 24-bit only
-    else:
-        bit_filter = None   # Both
+    # Parse positional rate/bits specs
+    rate_specs = None
+    if args.tests:
+        rate_specs = []
+        for spec in args.tests:
+            try:
+                rate_str, bits_str = spec.split("/")
+                rate = int(rate_str.rstrip("k")) * 1000
+                use_24bit = bits_str in ("24", "24bit")
+                if not use_24bit and bits_str not in ("16", "16bit"):
+                    print(f"Error: invalid bit depth '{bits_str}' in '{spec}' (use 16 or 24)")
+                    return 1
+                valid_rates = SAMPLE_RATES_24BIT if use_24bit else SAMPLE_RATES
+                if rate not in valid_rates:
+                    bit_str = "24-bit" if use_24bit else "16-bit"
+                    print(f"Error: rate {rate} not available for {bit_str} mode")
+                    print(f"Available: {sorted(valid_rates.keys())}")
+                    return 1
+                rate_specs.append((rate, use_24bit))
+            except ValueError:
+                print(f"Error: invalid test spec '{spec}' (expected RATE/BITS, e.g. 1920/16)")
+                return 1
 
-    # Determine test filter
-    if args.sync and args.duration:
-        test_filter = None  # Both
-    elif args.sync:
-        test_filter = 'sync'
-    elif args.duration:
-        test_filter = 'duration'
-    else:
-        test_filter = None  # All
+    if rate_specs:
+        # Specific combos imply hardware tests
+        test_filter = None
+        if args.sync and args.duration:
+            test_filter = None
+        elif args.sync:
+            test_filter = 'sync'
+        elif args.duration:
+            test_filter = 'duration'
 
-    # If specific test filters are set, imply --hw
-    if args.use_16bit or args.use_24bit or args.sync or args.duration:
-        args.hw = True
-
-    if args.sim or not args.hw:
-        print("\n--- SIMULATION TESTS ---")
-        results.extend(run_simulation_tests())
-
-    if args.hw or not args.sim:
         print("\n--- HARDWARE TESTS ---")
-        results.extend(run_hardware_tests(use_24bit=bit_filter, test_filter=test_filter))
+        results.extend(run_hardware_tests(rate_specs=rate_specs, test_filter=test_filter))
+    else:
+        # Original flag-based behavior
+        # Determine bit depth filter
+        if args.use_16bit and args.use_24bit:
+            bit_filter = None  # Both
+        elif args.use_16bit:
+            bit_filter = False  # 16-bit only
+        elif args.use_24bit:
+            bit_filter = True   # 24-bit only
+        else:
+            bit_filter = None   # Both
+
+        # Determine test filter
+        if args.sync and args.duration:
+            test_filter = None  # Both
+        elif args.sync:
+            test_filter = 'sync'
+        elif args.duration:
+            test_filter = 'duration'
+        else:
+            test_filter = None  # All
+
+        # If specific test filters are set, imply --hw
+        if args.use_16bit or args.use_24bit or args.sync or args.duration:
+            args.hw = True
+
+        if args.sim or not args.hw:
+            print("\n--- SIMULATION TESTS ---")
+            results.extend(run_simulation_tests())
+
+        if args.hw or not args.sim:
+            print("\n--- HARDWARE TESTS ---")
+            results.extend(run_hardware_tests(use_24bit=bit_filter, test_filter=test_filter))
 
     # Summary
     print("\n" + "=" * 70)
